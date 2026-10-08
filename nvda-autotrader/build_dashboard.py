@@ -1,1468 +1,1805 @@
 #!/usr/bin/env python3
 """
-NVDA AutoTrader — Dashboard Builder v4.97
-==========================================
+NVDA AutoTrader — Control Panel & Dashboard v4.98
+==================================================
 
 CLAUDE AI CONTEXT — READ THIS FIRST IF STARTING A NEW CHAT
 ============================================================
 This file is part of a two-file algorithmic paper trading system for NVDA stock.
+Since v4.98 it is the APP: run it and everything is done from the browser.
 
 FILES (all live in the same project folder):
-  nvda_autotrader.py        — Main bot (current version: v4.97)
-  build_dashboard.py        — This file. Generates nvda_live_dashboard.html
-  nvda_live_dashboard.html  — Generated dashboard (do NOT edit directly)
-  nvda_price_history.json   — Rolling 2000-point price history
-  nvda_bot_state.json       — Persisted session state (trades, P&L, etc.)
-  trade_logs/               — Daily summary .txt and master_trade_log.csv
+  build_dashboard.py        — This file. Control panel server + dashboard UI.
+  nvda_autotrader.py        — The trading bot. Started/stopped by this file.
+  nvda_strategy.pine        — TradingView Pine Script port of the strategies.
+  nvda_settings.json        — Saved keys + settings (written by the Settings tab;
+                              local only, never commit or share it).
+  nvda_price_history.json   — Rolling 2000-point price history (written by the bot)
+  bot_console.log           — Everything the bot printed (appended by this panel)
+  trade_logs/               — Daily summaries + master_trade_log.csv (bot)
 
 HOW TO RUN:
-  1. Start bot:      cd %USERPROFILE%\\Downloads\\NVDA && python nvda_autotrader.py
-  2. Rebuild dash:   python build_dashboard.py
-  3. View dashboard: http://localhost:8080  (NOT by opening the HTML file directly)
-  Task Scheduler runs the bot automatically at 8:20 AM daily.
+  python build_dashboard.py                       → opens http://127.0.0.1:8080
+  python build_dashboard.py --autostart --no-browser
+                                                  → Task Scheduler (8:20 AM): panel
+                                                    starts and launches the bot itself
+  python build_dashboard.py --build-only          → just write nvda_live_dashboard.html
 
-BROKER & DATA:
-  Alpaca paper trading (PAPER MODE). API keys are in nvda_autotrader.py top section.
-  Data: Alpaca IEX free feed (15-min delay). YFinance fallback for QQQ/MTF data.
-  To go live: change ALPACA_BASE_URL from paper-api to api.alpaca.markets + live keys.
+  1. Settings tab: paste Alpaca key ID + secret, pick Paper/Live, Test, Save.
+  2. Click Start Bot (top right). Stop/Restart from the same button.
+  3. TradingView tab: webhook + Pine Script setup.
 
-STRATEGIES (five run in parallel):
-  1. FVG Retrace     — Fair Value Gap detection, waits for retrace into gap zone
-  2. VWAP Bounce     — Monitors price vs VWAP ±1×ATR bands, enters on bounce
-  3. Spike Reversal  — Detects sharp spikes ≥2.5×ATR, enters counter-trend
-  4. Range Extreme   — Detects price at 5-day high/low with reversal candle (v4.17)
-  5. Swing Reversion — Fades price near 3mo/6mo high/low once intraday trend
-                        confirms a turn (v4.84, SWING-3M/SWING-6M variants)
-  FVG vs VWAP chosen at each kill zone via scoring. Spike + Range Extreme run always.
+HOW IT FITS TOGETHER:
+  browser ──▶ this panel (127.0.0.1:8080) ──▶ bot's own server (127.0.0.1:8081)
+  - /api/*            handled here (settings, start/stop, console, Pine file)
+  - /data, /history, /live_price, /daily_history, /manual_trade,
+    /close_manual_trade  proxied to the bot (same JSON as before)
+  - Keys are handed to the bot as environment variables when it starts.
+  - The bot can still run alone (python nvda_autotrader.py); it then serves
+    this same UI itself via render_html(standalone=True) — no Start/Stop or
+    Settings in that mode.
 
-KILL ZONES (ET):  09:30-11:00 | 12:00-13:00 | 14:00-15:55
-
-KEY CONFIG in nvda_autotrader.py:
-  risk_reward:           1.5    (target = 1.5× stop distance)
-  stop_atr_mult:         2.0    (bot stop = 2× ATR)
-  pdt_protection:        False  (set True for live sub-$25k accounts)
-  extreme_lookback_days: 5      (days back for range high/low)
-  extreme_proximity_mult:0.5    (within 0.5×ATR of extreme to trigger)
-  spike_atr_mult:        2.5    (spike must be ≥2.5×ATR)
-  spike_vwap_mult:       1.5    (price must be ≥1.5×ATR from VWAP)
-
-MULTI-TRADE ARCHITECTURE (v4.12+):
-  state["active_trades"]  — list of all open trades (bot + manual)
-  state["active_trade"]   — legacy alias → first non-MANUAL bot trade or None
-  get_bot_trade()         — returns first non-MANUAL trade or None
-  Manual trades fire real Alpaca orders. Bot trades use bracket orders for longs,
-  plain market sell for shorts (IEX free tier limitation).
-
-DASHBOARD FEATURES:
-  - ATR multiplier selector: 0.5× 1× 1.5× 2× 2.5× with live stop/target preview
-  - Manual trade modal: LONG/SHORT, qty, stop, target, managed/log-only, trailing stop
-  - Chart: 1 Hour / Today / 5 Days / 1 Month views
-  - After hours: bot stays alive serving dashboard until midnight (does not trade)
+SECURITY (v4.98):
+  - Binds to 127.0.0.1 only. Requests whose Host isn't loopback are refused
+    (DNS rebinding) and POSTs must be same-origin application/json (stops
+    other websites from posting to it). Never add CORS headers here.
+  - The secret key is never sent back to the browser — only a masked key ID.
 
 IMPORTANT RULES FOR CLAUDE:
-  - ALWAYS bump VERSION in both nvda_autotrader.py header AND this file when making changes
-  - ALWAYS run syntax check before presenting files: python3 -c "import ast; ast.parse(open('file').read())"
-  - After editing build_dashboard.py, user must run: python build_dashboard.py
-  - The bot serves nvda_live_dashboard.html via HTTPServer on port 8080
-  - HTTPServer binds to '' (all interfaces) — not 'localhost' (IPv6/IPv4 Windows issue)
+  - ALWAYS bump VERSION here AND in nvda_autotrader.py when making changes
+  - ALWAYS syntax-check: python3 -c "import ast; ast.parse(open('build_dashboard.py').read())"
+  - Bind HTTP servers to 127.0.0.1 — not '' and not 'localhost'
   - Short orders use plain market sell (no bracket) — Alpaca IEX free tier limitation
-  - Manual trade auto-calc uses atr_mult from dashboard (0.5-2.5×), not hardcoded 2×
-  - _check_range_extreme() and _check_spike_reversal() both return:
-    ("bullish"/"bearish", entry, stop, target, risk, reason) or None
+  - Manual trade auto-calc uses atr_mult from the dashboard (0.5-2.5×)
+  - Escape every bot-provided string with esc() before putting it in innerHTML
 
-ACCOUNT STATUS (as of 2026-06-04, not refreshed by this cleanup pass):
-  Starting equity (May 26): $100,366.41
-  Current equity:           $100,637.63
-  Paper trading — Alpaca paper account
-
-HOW TO EDIT THIS DASHBOARD:
-  - CSS:       get_css()
-  - HTML:      get_body_html()
-  - JS:        get_js()  — BAKED_HISTORY is injected automatically from price JSON
-  After any edit run: python build_dashboard.py
+HOW TO EDIT THE UI:
+  - CSS:  CSS string      - HTML: BODY_HTML string      - JS: JS string
+  - render_html() stitches them; no build step needed — just restart the panel.
 """
 
-
+import argparse
+import collections
 import json
 import os
-import re
+import secrets
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import webbrowser
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 # ═══════════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════════
 
-DASHBOARD_FILE   = "nvda_live_dashboard.html"
-PRICE_HIST_FILE  = "nvda_price_history.json"
-BOT_PORT         = 8080
-VERSION          = "v4.97"
+VERSION         = "v4.98"
+HERE            = os.path.dirname(os.path.abspath(__file__))
+BOT_SCRIPT      = os.path.join(HERE, "nvda_autotrader.py")
+SETTINGS_FILE   = os.path.join(HERE, "nvda_settings.json")
+PRICE_HIST_FILE = os.path.join(HERE, "nvda_price_history.json")
+PINE_FILE       = os.path.join(HERE, "nvda_strategy.pine")
+CONSOLE_LOG     = os.path.join(HERE, "bot_console.log")
+DASHBOARD_FILE  = os.path.join(HERE, "nvda_live_dashboard.html")
+
+PANEL_HOST = "127.0.0.1"
+PANEL_PORT = 8080
+BOT_HOST   = "127.0.0.1"
+
+PAPER_BASE_URL = "https://paper-api.alpaca.markets"
+LIVE_BASE_URL  = "https://api.alpaca.markets"
+
+DEFAULT_SETTINGS = {
+    "alpaca_api_key":    "",
+    "alpaca_secret_key": "",
+    "trading_mode":      "paper",   # "paper" | "live"
+    "signal_source":     "bot",     # "bot" | "tradingview" | "both"
+    "auto_restart":      True,      # restart the bot if it crashes / watchdog exits
+    "bot_port":          8081,
+    "tv_enabled":        False,
+    "tv_port":           8090,
+    "tv_passphrase":     "",
+    "tv_public_url":     "",        # your ngrok / cloudflared https URL (display only)
+}
+
+# Bot exit codes that mean "don't restart, a human needs to look":
+#   0 clean exit (midnight / weekend), 2 no keys, 3 Alpaca rejected the keys
+NO_RESTART_CODES = {0, 2, 3}
 
 
 # ═══════════════════════════════════════════════════════════════
-# CSS
+# SETTINGS
 # ═══════════════════════════════════════════════════════════════
 
-def get_css():
-    return """
+_settings_lock = threading.Lock()
 
-@import url('https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=DM+Sans:wght@300;400;500;700&display=swap');
-:root {
-  --bg:#080c14; --surface:#0f1520; --card:#131d2e; --border:#1e2d42;
-  --accent:#00e5c0; --red:#ff4560; --yellow:#ffcc44; --blue:#3b82f6;
-  --text:#dde8f5; --muted:#4a6080; --win:#00e5c0; --loss:#ff4560;
-}
-*{box-sizing:border-box;margin:0;padding:0;}
-body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;min-height:100vh;padding:20px;}
-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--border);}
-.logo{font-family:'Space Mono',monospace;font-size:1rem;color:var(--accent);letter-spacing:.06em;}
-.logo span{display:block;font-size:.65rem;color:var(--muted);margin-top:3px;font-style:italic;}
-.live-dot{display:flex;align-items:center;gap:8px;font-family:'Space Mono',monospace;font-size:.7rem;color:var(--muted);}
-.dot{width:8px;height:8px;border-radius:50%;background:var(--muted);}
-.dot.live{background:var(--accent);box-shadow:0 0 8px var(--accent);animation:pulse 2s infinite;}
-.dot.error{background:var(--red);}
-@keyframes pulse{0%,100%{opacity:1;}50%{opacity:.4;}}
-#conn-banner{background:rgba(255,69,96,.12);border:1px solid rgba(255,69,96,.3);border-radius:6px;padding:12px 16px;margin-bottom:20px;font-family:'Space Mono',monospace;font-size:.75rem;color:var(--red);display:none;}
-.status-bar{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:12px 18px;margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;gap:12px;}
-.status-text{font-family:'Space Mono',monospace;font-size:.78rem;color:var(--accent);}
-.status-meta{font-family:'Space Mono',monospace;font-size:.65rem;color:var(--muted);text-align:right;}
-.kz-bar{display:flex;gap:8px;margin-bottom:20px;}
-.kz-slot{flex:1;text-align:center;padding:8px 4px;font-family:'Space Mono',monospace;font-size:.65rem;color:var(--muted);background:var(--card);border:1px solid var(--border);border-radius:6px;}
-.kz-slot.active{color:var(--accent);border-color:var(--accent);background:rgba(0,229,192,.07);}
-.kz-slot.passed{color:var(--border);border-color:var(--border);}
-.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:20px;}
-.stat-card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;position:relative;overflow:hidden;transition:border-color .3s;}
-.stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:var(--accent);transition:background .3s;}
-.stat-card.red::before{background:var(--red);}
-.stat-card.yellow::before{background:var(--yellow);}
-.stat-card.blue::before{background:var(--blue);}
-.stat-label{font-family:'Space Mono',monospace;font-size:.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;margin-bottom:8px;}
-.stat-value{font-family:'Space Mono',monospace;font-size:1.5rem;font-weight:700;line-height:1;transition:color .3s;}
-.stat-value.up{color:var(--win);}.stat-value.down{color:var(--loss);}.stat-value.flat{color:var(--text);}
-.stat-sub{font-size:.68rem;color:var(--muted);margin-top:5px;}
-.main-grid{display:grid;grid-template-columns:1fr 340px;gap:16px;margin-bottom:16px;}
-@media(max-width:900px){.main-grid{grid-template-columns:1fr;}}
-.chart-card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:18px;}
-.chart-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;}
-.card-title{font-family:'Space Mono',monospace;font-size:.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;}
-.range-tabs{display:flex;gap:4px;}
-.range-tab{font-family:'Space Mono',monospace;font-size:.62rem;padding:4px 10px;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer;transition:all .15s;letter-spacing:.05em;}
-.range-tab:hover{border-color:var(--accent);color:var(--accent);}
-.range-tab.active{background:rgba(0,229,192,.1);border-color:var(--accent);color:var(--accent);}
-.chart-wrap{position:relative;height:260px;}
-.range-hint{font-family:'Space Mono',monospace;font-size:.6rem;color:var(--muted);text-align:center;margin-top:8px;opacity:.6;}
-.trade-panel{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:18px;display:flex;flex-direction:column;gap:14px;}
-.trade-empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--muted);font-size:.8rem;gap:8px;min-height:160px;}
-.trade-empty .icon{font-size:2rem;}
-.trade-row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid rgba(255,255,255,.04);}
-.trade-row:last-child{border-bottom:none;}
-.trade-key{font-family:'Space Mono',monospace;font-size:.65rem;color:var(--muted);text-transform:uppercase;}
-.trade-val{font-family:'Space Mono',monospace;font-size:.8rem;font-weight:700;}
-.fvg-list{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:18px;margin-bottom:16px;}
-.fvg-items{display:flex;flex-direction:column;gap:8px;}
-.fvg-item{display:flex;align-items:center;gap:10px;padding:10px 12px;background:var(--surface);border-radius:5px;border-left:3px solid var(--border);}
-.fvg-item.bullish{border-left-color:var(--win);}.fvg-item.bearish{border-left-color:var(--loss);}
-.fvg-badge{font-family:'Space Mono',monospace;font-size:.6rem;font-weight:700;padding:2px 6px;border-radius:3px;white-space:nowrap;}
-.fvg-badge.bullish{background:rgba(0,229,192,.12);color:var(--win);}.fvg-badge.bearish{background:rgba(255,69,96,.12);color:var(--loss);}
-.fvg-details{flex:1;font-size:.75rem;}
-.fvg-score{text-align:right;}
-.score-pips{display:flex;gap:3px;justify-content:flex-end;}
-.pip{width:6px;height:6px;border-radius:1px;}
-.pip.on{background:var(--accent);}.pip.off{background:var(--border);}
-.fvg-empty{color:var(--muted);font-size:.8rem;text-align:center;padding:24px;}
-.log-card{background:var(--card);border:1px solid var(--border);border-radius:8px;margin-bottom:16px;overflow:hidden;}
-.log-inner{max-height:240px;overflow-y:auto;}
-.log-entry{display:flex;align-items:flex-start;gap:10px;padding:8px 14px;border-bottom:1px solid rgba(255,255,255,.03);font-size:.72rem;}
-.log-time{font-family:'Space Mono',monospace;color:var(--muted);white-space:nowrap;font-size:.65rem;padding-top:1px;}
-.log-level{font-family:'Space Mono',monospace;font-size:.62rem;padding:2px 5px;border-radius:3px;white-space:nowrap;}
-.log-level.INFO{background:rgba(0,229,192,.1);color:var(--accent);}
-.log-level.WARN{background:rgba(255,204,68,.1);color:var(--yellow);}
-.log-level.ERROR{background:rgba(255,69,96,.1);color:var(--red);}
-.log-level.TRADE{background:rgba(59,130,246,.1);color:var(--blue);}
-.log-level.REPORT{background:rgba(59,130,246,.1);color:var(--blue);}
-.log-msg{color:var(--text);line-height:1.4;word-break:break-word;}
 
-/* ── MANUAL TRADE MODAL ── */
-.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:100;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(4px);}
-.modal-backdrop.hidden{display:none;}
-.modal{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:28px;width:420px;max-width:95vw;position:relative;}
-.modal-title{font-family:'Space Mono',monospace;font-size:.9rem;color:var(--accent);margin-bottom:20px;letter-spacing:.05em;}
-.modal-close{position:absolute;top:16px;right:16px;background:none;border:none;color:var(--muted);cursor:pointer;font-size:1.1rem;line-height:1;padding:4px 8px;border-radius:4px;}
-.modal-close:hover{color:var(--text);background:rgba(255,255,255,.05);}
-.field-group{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px;}
-.field-group.full{grid-template-columns:1fr;}
-.field{display:flex;flex-direction:column;gap:6px;}
-.field label{font-family:'Space Mono',monospace;font-size:.6rem;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;}
-.field input,.field select{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px 12px;color:var(--text);font-family:'Space Mono',monospace;font-size:.8rem;outline:none;transition:border-color .2s;}
-.field input[readonly]{color:var(--accent);cursor:not-allowed;border-color:rgba(0,229,192,.3);background:rgba(0,229,192,.05);}
-.field input:focus,.field select:focus{border-color:var(--accent);}
-.field select option{background:var(--card);}
-.atr-row{display:flex;align-items:center;gap:10px;margin-bottom:16px;padding:10px 12px;background:var(--surface);border-radius:6px;border:1px solid var(--border);}
-.atr-row label{font-family:'Space Mono',monospace;font-size:.7rem;color:var(--muted);cursor:pointer;flex:1;}
-.atr-row input[type=checkbox]{accent-color:var(--accent);width:14px;height:14px;cursor:pointer;}
-.atr-hint{font-size:.65rem;color:var(--muted);opacity:.7;}
-.atr-mult-btn{background:var(--card);border:1px solid var(--border);color:var(--muted);border-radius:4px;padding:3px 10px;font-size:.7rem;cursor:pointer;font-family:'Space Mono',monospace;transition:all .15s;}
-.atr-mult-btn:hover{border-color:var(--accent);color:var(--accent);}
-.atr-mult-btn.active{background:var(--accent);border-color:var(--accent);color:#000;font-weight:700;}
-.managed-row{display:flex;gap:8px;margin-bottom:20px;}
-.managed-btn{flex:1;padding:10px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--muted);font-family:'Space Mono',monospace;font-size:.7rem;cursor:pointer;transition:all .15s;text-align:center;}
-.managed-btn.selected-managed{border-color:var(--accent);color:var(--accent);background:rgba(0,229,192,.08);}
-.managed-btn.selected-log{border-color:var(--yellow);color:var(--yellow);background:rgba(255,204,68,.08);}
-.dir-row{display:flex;gap:8px;margin-bottom:16px;}
-.dir-btn{flex:1;padding:10px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--muted);font-family:'Space Mono',monospace;font-size:.75rem;cursor:pointer;transition:all .15s;text-align:center;}
-.dir-btn.selected-long{border-color:var(--win);color:var(--win);background:rgba(0,229,192,.08);}
-.dir-btn.selected-short{border-color:var(--loss);color:var(--loss);background:rgba(255,69,96,.08);}
-.submit-btn{width:100%;padding:12px;border-radius:8px;border:none;background:var(--accent);color:#080c14;font-family:'Space Mono',monospace;font-size:.8rem;font-weight:700;cursor:pointer;letter-spacing:.05em;transition:opacity .15s;}
-.submit-btn:hover{opacity:.85;}
-.submit-btn:disabled{opacity:.4;cursor:not-allowed;}
-.modal-error{color:var(--red);font-family:'Space Mono',monospace;font-size:.7rem;margin-top:10px;display:none;}
-.modal-success{color:var(--win);font-family:'Space Mono',monospace;font-size:.7rem;margin-top:10px;display:none;}
-.manual-trade-btn{font-family:'Space Mono',monospace;font-size:.65rem;padding:5px 12px;border-radius:5px;border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer;transition:all .2s;letter-spacing:.05em;}
-.manual-trade-btn:hover{border-color:var(--accent);color:var(--accent);}
-.close-trade-btn{font-family:'Space Mono',monospace;font-size:.65rem;padding:5px 12px;border-radius:5px;border:1px solid rgba(255,69,96,.4);background:transparent;color:var(--loss);cursor:pointer;transition:all .2s;}
-.close-trade-btn:hover{background:rgba(255,69,96,.1);}
+def load_settings():
+    s = dict(DEFAULT_SETTINGS)
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            s.update({k: v for k, v in data.items() if k in DEFAULT_SETTINGS})
+    except (OSError, ValueError):
+        pass
+    return s
 
-"""
+
+def save_settings(s):
+    with _settings_lock:
+        tmp = SETTINGS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(s, f, indent=2)
+        try:
+            os.chmod(tmp, 0o600)   # owner-only on macOS/Linux; no-op on Windows
+        except OSError:
+            pass
+        os.replace(tmp, SETTINGS_FILE)
+
+
+def mask_key(k):
+    if not k:
+        return ""
+    return k[:4] + "•" * 6 + k[-4:] if len(k) > 10 else "•" * len(k)
+
+
+def public_settings(s):
+    """What the browser may see — the secret key never leaves this process."""
+    return {
+        "api_key_masked": mask_key(s["alpaca_api_key"]),
+        "has_api_key":    bool(s["alpaca_api_key"]),
+        "has_secret":     bool(s["alpaca_secret_key"]),
+        "trading_mode":   s["trading_mode"],
+        "signal_source":  s["signal_source"],
+        "auto_restart":   bool(s["auto_restart"]),
+        "tv_enabled":     bool(s["tv_enabled"]),
+        "tv_port":        int(s["tv_port"]),
+        "tv_passphrase":  s["tv_passphrase"],   # needed to paste into the Pine inputs
+        "tv_public_url":  s["tv_public_url"],
+        "settings_file":  SETTINGS_FILE,
+    }
+
+
+def apply_settings_update(body):
+    s = load_settings()
+    key = str(body.get("alpaca_api_key") or "").strip()
+    sec = str(body.get("alpaca_secret_key") or "").strip()
+    if body.get("clear_keys"):
+        s["alpaca_api_key"] = s["alpaca_secret_key"] = ""
+    if key:
+        s["alpaca_api_key"] = key
+    if sec:
+        s["alpaca_secret_key"] = sec
+
+    mode = body.get("trading_mode")
+    if mode in ("paper", "live"):
+        if mode == "live" and s["trading_mode"] != "live" and not body.get("confirm_live"):
+            raise ValueError("Switching to LIVE needs confirmation")
+        s["trading_mode"] = mode
+    src = body.get("signal_source")
+    if src in ("bot", "tradingview", "both"):
+        s["signal_source"] = src
+    for flag in ("auto_restart", "tv_enabled"):
+        if flag in body:
+            s[flag] = bool(body[flag])
+    if "tv_port" in body:
+        port = int(body["tv_port"])
+        if not 1024 <= port <= 65535 or port in (PANEL_PORT, int(s["bot_port"])):
+            raise ValueError("Webhook port must be 1024-65535 and not 8080/8081")
+        s["tv_port"] = port
+    if "tv_passphrase" in body:
+        pw = str(body["tv_passphrase"]).strip()
+        if pw and len(pw) < 12:
+            raise ValueError("Use a passphrase of at least 12 characters")
+        s["tv_passphrase"] = pw
+    if "tv_public_url" in body:
+        s["tv_public_url"] = str(body["tv_public_url"]).strip()[:300]
+    if s["tv_enabled"] and not s["tv_passphrase"]:
+        raise ValueError("Set a webhook passphrase before enabling TradingView")
+    save_settings(s)
+    return s
+
+
+def test_alpaca_keys(key, secret, mode):
+    base = LIVE_BASE_URL if mode == "live" else PAPER_BASE_URL
+    if not key or not secret:
+        return {"ok": False, "error": "Enter both the key ID and the secret key"}
+    req = urllib.request.Request(base + "/v2/account", headers={
+        "APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            acct = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            other = "live" if mode == "paper" else "paper"
+            return {"ok": False, "error": f"Alpaca rejected these keys for {mode.upper()} "
+                                          f"(HTTP {e.code}). Paper and live accounts have "
+                                          f"different keys — are these {other} keys?"}
+        return {"ok": False, "error": f"Alpaca returned HTTP {e.code}"}
+    except Exception as e:
+        return {"ok": False, "error": f"Could not reach Alpaca: {e}"}
+    return {
+        "ok": True,
+        "mode": mode,
+        "status": acct.get("status"),
+        "equity": float(acct.get("equity") or 0),
+        "buying_power": float(acct.get("buying_power") or 0),
+        "pattern_day_trader": bool(acct.get("pattern_day_trader")),
+        "account": mask_key(str(acct.get("account_number") or "")),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════
-# BODY HTML
+# BOT PROCESS
 # ═══════════════════════════════════════════════════════════════
 
-def get_body_html():
-    return """</head>
-<body>
+class BotProcess:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.proc = None
+        self.lines = collections.deque(maxlen=3000)
+        self.line_no = 0
+        self.desired = False
+        self.started_at = None
+        self.restarts = 0
+        self.restart_times = collections.deque(maxlen=5)
+        self.last_exit = None
+        self.last_exit_note = ""
+        self.running_mode = None
 
-<header>
-  <div class="logo">NVDA AUTOTRADER<span>{VERSION} · Paper Trading</span></div>
-  <div style="display:flex;align-items:center;gap:12px">
-    <button class="manual-trade-btn" onclick="openModal()" id="manual-btn">+ Manual Trade</button>
-    <div class="live-dot">
-      <div class="dot" id="live-dot"></div>
-      <span id="live-label">Connecting...</span>
-    </div>
-  </div>
-</header>
+    # ── console ────────────────────────────────────────────────
+    def _add(self, line):
+        with self.lock:
+            self.line_no += 1
+            self.lines.append((self.line_no, line))
+        try:
+            if os.path.exists(CONSOLE_LOG) and os.path.getsize(CONSOLE_LOG) > 20_000_000:
+                os.replace(CONSOLE_LOG, CONSOLE_LOG + ".old")
+            with open(CONSOLE_LOG, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
 
-<div id="conn-banner">⚠ Bot disconnected — make sure nvda_autotrader.py is running on port 8080</div>
+    def note(self, msg):
+        self._add(f"[panel {datetime.now().strftime('%H:%M:%S')}] {msg}")
 
-<div class="status-bar">
-  <div class="status-text" id="status-text">Waiting for data...</div>
-  <div class="status-meta" id="status-meta"></div>
-</div>
+    def console_since(self, after):
+        with self.lock:
+            out = [{"n": n, "line": l} for n, l in self.lines if n > after]
+            return out, self.line_no
 
-<div class="kz-bar">
-  <div class="kz-slot" id="kz-0">09:30–11:00 ET</div>
-  <div class="kz-slot" id="kz-1">12:00–13:00 ET</div>
-  <div class="kz-slot" id="kz-2">14:00–15:55 ET</div>
-</div>
+    # ── lifecycle ──────────────────────────────────────────────
+    def is_running(self):
+        with self.lock:
+            return self.proc is not None and self.proc.poll() is None
 
-<div class="stats-grid">
-  <div class="stat-card" id="card-price">
-    <div class="stat-label">NVDA Price</div>
-    <div class="stat-value flat" id="val-price">—</div>
-    <div class="stat-sub" id="sub-price">Scanned —</div>
-  </div>
-  <div class="stat-card yellow" id="card-trend">
-    <div class="stat-label">Trend</div>
-    <div class="stat-value flat" id="val-trend">—</div>
-    <div class="stat-sub">10-candle lookback</div>
-  </div>
-  <div class="stat-card" id="card-qqq">
-    <div class="stat-label">QQQ Direction</div>
-    <div class="stat-value flat" id="val-qqq">—</div>
-    <div class="stat-sub">Market context</div>
-  </div>
-  <div class="stat-card" id="card-fvgs">
-    <div class="stat-label">FVGs Today</div>
-    <div class="stat-value flat" id="val-fvgs">0</div>
-    <div class="stat-sub" id="sub-fvgs">Best score: 0/9</div>
-  </div>
-  <div class="stat-card blue">
-    <div class="stat-label">Portfolio</div>
-    <div class="stat-value flat" id="val-equity">—</div>
-    <div class="stat-sub" id="sub-equity">Paper account</div>
-  </div>
-  <div class="stat-card" id="card-pnl">
-    <div class="stat-label">Trade P&amp;L</div>
-    <div class="stat-value flat" id="val-pnl">—</div>
-    <div class="stat-sub" id="sub-pnl">No trade yet</div>
-  </div>
-  <div class="stat-card" id="card-strategy">
-    <div class="stat-label">Strategy</div>
-    <div class="stat-value flat" id="val-strategy">—</div>
-    <div class="stat-sub" id="sub-strategy">Kill zone active</div>
-  </div>
-  <div class="stat-card" id="card-mtf">
-    <div class="stat-label">MTF Bias</div>
-    <div class="stat-value flat" id="val-mtf">—</div>
-    <div class="stat-sub" id="sub-mtf">Weekly · Monthly</div>
-  </div>
-</div>
+    def start(self, reason="started from dashboard"):
+        s = load_settings()
+        if not s["alpaca_api_key"] or not s["alpaca_secret_key"]:
+            raise ValueError("Add your Alpaca keys in Settings first")
+        if not os.path.exists(BOT_SCRIPT):
+            raise ValueError(f"Bot script not found: {BOT_SCRIPT}")
+        with self.lock:
+            if self.is_running():
+                return
+            env = os.environ.copy()
+            env.update({
+                "ALPACA_API_KEY":     s["alpaca_api_key"],
+                "ALPACA_SECRET_KEY":  s["alpaca_secret_key"],
+                "ALPACA_BASE_URL":    LIVE_BASE_URL if s["trading_mode"] == "live" else PAPER_BASE_URL,
+                "NVDA_BOT_HOST":      BOT_HOST,
+                "NVDA_BOT_PORT":      str(s["bot_port"]),
+                "NVDA_SIGNAL_SOURCE": s["signal_source"],
+                "NVDA_TV_ENABLED":    "1" if s["tv_enabled"] else "0",
+                "NVDA_TV_PASSPHRASE": s["tv_passphrase"],
+                "NVDA_TV_PORT":       str(s["tv_port"]),
+                "PYTHONIOENCODING":   "utf-8",
+                "PYTHONUNBUFFERED":   "1",
+            })
+            kwargs = {}
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            self.proc = subprocess.Popen(
+                [sys.executable, "-u", BOT_SCRIPT], cwd=HERE, env=env,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", bufsize=1, **kwargs)
+            self.desired = True
+            self.started_at = time.time()
+            self.running_mode = s["trading_mode"]
+            self.note(f"bot {reason} (pid {self.proc.pid}, {s['trading_mode'].upper()}, "
+                      f"signals: {s['signal_source']})")
+            threading.Thread(target=self._pump, args=(self.proc,), daemon=True).start()
 
-<div class="main-grid">
-  <div class="chart-card">
-    <div class="chart-header">
-      <div class="card-title" style="margin:0">NVDA Price</div>
-      <div class="range-tabs">
-        <button class="range-tab active" data-range="1h">1 Hour</button>
-        <button class="range-tab" data-range="1d">Today</button>
-        <button class="range-tab" data-range="5d">5 Days</button>
-        <button class="range-tab" data-range="1m">1 Month</button>
-        <button class="range-tab" data-range="6m">6 Month</button>
-      </div>
-    </div>
-    <div class="chart-wrap"><canvas id="priceChart"></canvas></div>
-    <div class="range-hint" id="range-hint">Loading...</div>
-  </div>
-  <div class="trade-panel">
-    <div class="card-title">Active Trade</div>
-    <div id="trade-content">
-      <div class="trade-empty"><div class="icon">⏳</div><div>No active trade</div></div>
-    </div>
-  </div>
-</div>
+    def _pump(self, proc):
+        for line in proc.stdout:
+            self._add(line.rstrip("\r\n"))
+        rc = proc.wait()
+        self._on_exit(proc, rc)
 
-<div class="fvg-list">
-  <div class="card-title">FVGs Detected Today</div>
-  <div class="fvg-items" id="fvg-items"><div class="fvg-empty">No FVGs detected yet today</div></div>
-</div>
+    def _on_exit(self, proc, rc):
+        with self.lock:
+            if proc is not self.proc:
+                return
+            self.proc = None
+            self.last_exit = rc
+            self.last_exit_note = {
+                0: "exited normally (end of day / weekend)",
+                2: "no API keys — add them in Settings",
+                3: "Alpaca refused the connection — check keys and Paper/Live in Settings",
+            }.get(rc, "stopped" if not self.desired else "crashed or was restarted by its watchdog")
+            self.note(f"bot exited with code {rc}: {self.last_exit_note}")
+            restart = (self.desired and rc not in NO_RESTART_CODES
+                       and load_settings().get("auto_restart", True))
+            if rc in NO_RESTART_CODES:
+                self.desired = False
+            if restart:
+                now = time.time()
+                recent = [t for t in self.restart_times if now - t < 600]
+                if len(recent) >= 5:
+                    self.desired = False
+                    self.note("bot crashed 5 times in 10 minutes — auto-restart paused. "
+                              "Check the console, then click Start Bot.")
+                    return
+                self.restart_times.append(now)
+                self.restarts += 1
+        if restart:
+            threading.Thread(target=self._delayed_restart, daemon=True).start()
 
-<div class="log-card">
-  <div style="padding:12px 16px;border-bottom:1px solid var(--border)">
-    <div class="card-title" style="margin:0">Live Event Log</div>
-  </div>
-  <div class="log-inner" id="log-inner">
-    <div class="log-entry"><span class="log-msg" style="color:var(--muted)">Waiting for bot data...</span></div>
-  </div>
-</div>
+    def _delayed_restart(self):
+        time.sleep(5)
+        with self.lock:
+            if not self.desired or self.is_running():
+                return
+        try:
+            self.start(reason="auto-restarted")
+        except Exception as e:
+            self.note(f"auto-restart failed: {e}")
 
-<!-- ── MANUAL TRADE MODAL ── -->
-<div class="modal-backdrop hidden" id="modal-backdrop" onclick="closeModalOutside(event)">
-  <div class="modal">
-    <div class="modal-title">+ Manual Trade Entry</div>
-    <button class="modal-close" onclick="closeModal()">✕</button>
+    def stop(self):
+        with self.lock:
+            self.desired = False
+            proc = self.proc
+        if proc is None or proc.poll() is not None:
+            return
+        self.note("stopping bot (open positions stay open on Alpaca)")
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
 
-    <div class="dir-row">
-      <button class="dir-btn" id="btn-long"  onclick="setDir('bullish')">▲ LONG</button>
-      <button class="dir-btn" id="btn-short" onclick="setDir('bearish')">▼ SHORT</button>
-    </div>
+    def status(self):
+        s = load_settings()
+        with self.lock:
+            running = self.is_running()
+            return {
+                "running":     running,
+                "pid":         self.proc.pid if running else None,
+                "uptime_s":    int(time.time() - self.started_at) if running and self.started_at else 0,
+                "restarts":    self.restarts,
+                "desired":     self.desired,
+                "last_exit":   self.last_exit,
+                "last_exit_note": self.last_exit_note,
+                "keys_set":    bool(s["alpaca_api_key"] and s["alpaca_secret_key"]),
+                "mode":        self.running_mode if running else s["trading_mode"],
+                "saved_mode":  s["trading_mode"],
+                "signal_source": s["signal_source"],
+            }
 
-    <div class="field-group">
-      <div class="field">
-        <label>Entry Price (live — not editable)</label>
-        <input type="number" id="m-entry" step="0.01" placeholder="0.00" readonly>
-      </div>
-      <div class="field">
-        <label>Quantity (shares)</label>
-        <input type="number" id="m-qty" step="1" placeholder="0">
-      </div>
-    </div>
-    <div id="m-price-hint" style="font-family:'Space Mono',monospace;font-size:.62rem;color:var(--accent);margin:-8px 0 12px 0;opacity:.8;"></div>
 
-    <div class="atr-row">
-      <input type="checkbox" id="m-atr" onchange="toggleAtr()">
-      <label for="m-atr">Auto-calculate stop &amp; target from ATR</label>
-      <span class="atr-hint" id="atr-hint"></span>
-    </div>
-    <div id="atr-mult-row" style="display:none;margin:-4px 0 12px 0;">
-      <div style="font-size:.65rem;color:var(--muted);margin-bottom:5px;">ATR multiplier for stop distance:</div>
-      <div style="display:flex;gap:6px;flex-wrap:wrap;">
-        <button class="atr-mult-btn" onclick="setAtrMult(0.5)">0.5×</button>
-        <button class="atr-mult-btn active" onclick="setAtrMult(1.0)">1×</button>
-        <button class="atr-mult-btn" onclick="setAtrMult(1.5)">1.5×</button>
-        <button class="atr-mult-btn" onclick="setAtrMult(2.0)">2×</button>
-        <button class="atr-mult-btn" onclick="setAtrMult(2.5)">2.5×</button>
-      </div>
-      <div id="atr-preview" style="font-size:.65rem;color:var(--accent);margin-top:6px;font-family:'Space Mono',monospace;"></div>
-    </div>
-
-    <div id="manual-stop-target">
-      <div class="field-group">
-        <div class="field">
-          <label>Stop Price</label>
-          <input type="number" id="m-stop" step="0.01" placeholder="0.00" oninput="updateBracketHint()">
-        </div>
-        <div class="field">
-          <label>Target Price</label>
-          <input type="number" id="m-target" step="0.01" placeholder="0.00" oninput="updateBracketHint()">
-        </div>
-      </div>
-      <div id="m-bracket-hint" style="font-family:'Space Mono',monospace;font-size:.62rem;margin:-8px 0 12px 0;"></div>
-    </div>
-
-    <div style="margin-bottom:12px">
-      <div class="field"><label>Monitor Mode</label></div>
-      <div class="managed-row" style="margin-top:6px">
-        <button class="managed-btn selected-managed" id="btn-managed"  onclick="setManaged(true)">Managed (bot monitors stop/target)</button>
-        <button class="managed-btn"                  id="btn-logonly"  onclick="setManaged(false)">Log Only (no auto-close)</button>
-      </div>
-    </div>
-
-    <div class="atr-row" id="trail-row">
-      <input type="checkbox" id="m-trail" onchange="toggleTrail()">
-      <label for="m-trail">Enable trailing stop (breakeven at 1:1, trail at 2:1)</label>
-      <span class="atr-hint" id="trail-hint"></span>
-    </div>
-
-    <button class="submit-btn" id="submit-btn" onclick="submitManualTrade()">Enter Trade</button>
-    <div class="modal-error"   id="modal-error"></div>
-    <div class="modal-success" id="modal-success"></div>
-  </div>
-</div>
-
-<!-- ── CLOSE MANUAL TRADE MODAL ── -->
-<div class="modal-backdrop hidden" id="close-modal-backdrop" onclick="closeCloseModal(event)">
-  <div class="modal">
-    <div class="modal-title">✕ Close Manual Trade</div>
-    <button class="modal-close" onclick="closeCloseModal()">✕</button>
-    <div class="field-group full">
-      <div class="field">
-        <label>Realized P&amp;L ($)</label>
-        <input type="number" id="c-pnl" step="0.01" placeholder="e.g. 45.00 or -22.50">
-      </div>
-    </div>
-    <button class="submit-btn" onclick="submitClose()">Confirm Close</button>
-    <div class="modal-error" id="close-error"></div>
-  </div>
-</div>"""
+BOT = BotProcess()
 
 
 # ═══════════════════════════════════════════════════════════════
-# JAVASCRIPT
+# HTTP — control panel
 # ═══════════════════════════════════════════════════════════════
 
-def get_js(baked_history):
-    baked_json = json.dumps(baked_history)
+_LOOPBACK = {"127.0.0.1", "localhost", "::1", "[::1]"}
+_PROXY_GET = {"/data": 8, "/history": 8, "/live_price": 8, "/daily_history": 25}
+_PROXY_POST = {"/manual_trade": 60, "/close_manual_trade": 30}
+
+
+def _host_only(h):
+    h = (h or "").strip().lower()
+    if h.startswith("["):
+        return h.split("]")[0] + "]"
+    return h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+
+
+class PanelHandler(BaseHTTPRequestHandler):
+    server_version = "NVDAPanel/" + VERSION
+
+    def log_message(self, format, *args):
+        pass
+
+    # ── helpers ────────────────────────────────────────────────
+    def _send(self, code, body, ctype="application/json"):
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body)
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.end_headers()
+            self.wfile.write(body)
+        except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _trusted(self, is_post):
+        if _host_only(self.headers.get("Host")) not in _LOOPBACK:
+            return False
+        if not is_post:
+            return True
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            return False
+        origin = self.headers.get("Origin")
+        if origin and origin.rstrip("/").lower() != "http://" + (self.headers.get("Host") or "").lower():
+            return False
+        return True
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 100_000:
+            raise ValueError("Request too large")
+        raw = self.rfile.read(n) if n else b"{}"
+        data = json.loads(raw.decode("utf-8") or "{}")
+        if not isinstance(data, dict):
+            raise ValueError("Expected a JSON object")
+        return data, raw
+
+    def _proxy(self, method, path, raw=None, timeout=10):
+        port = int(load_settings()["bot_port"])
+        req = urllib.request.Request(f"http://{BOT_HOST}:{port}{path}", data=raw, method=method)
+        if raw is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+        except Exception:
+            return None, None
+
+    # ── GET ────────────────────────────────────────────────────
+    def do_GET(self):
+        if not self._trusted(False):
+            return self._send(403, {"ok": False, "error": "Forbidden"})
+        path = self.path.split("?")[0]
+        query = self.path[len(path) + 1:] if "?" in self.path else ""
+        try:
+            if path in ("/", "/dashboard"):
+                return self._send(200, render_html(standalone=False), "text/html; charset=utf-8")
+            if path == "/api/settings":
+                return self._send(200, public_settings(load_settings()))
+            if path == "/api/bot/status":
+                return self._send(200, BOT.status())
+            if path == "/api/bot/console":
+                after = 0
+                for part in query.split("&"):
+                    if part.startswith("after="):
+                        after = int(part[6:] or 0)
+                lines, last = BOT.console_since(after)
+                return self._send(200, {"lines": lines[-1000:], "last": last})
+            if path == "/api/pine":
+                try:
+                    with open(PINE_FILE, "r", encoding="utf-8") as f:
+                        return self._send(200, f.read(), "text/plain; charset=utf-8")
+                except OSError:
+                    return self._send(404, "nvda_strategy.pine not found next to build_dashboard.py",
+                                      "text/plain; charset=utf-8")
+            if path in _PROXY_GET:
+                status, body = self._proxy("GET", path, timeout=_PROXY_GET[path])
+                if status is not None:
+                    return self._send(status, body)
+                if path == "/history":     # bot offline: still show saved history
+                    return self._send(200, load_price_history())
+                return self._send(503, {"ok": False, "offline": True,
+                                        "error": "Bot is not running — click Start Bot"})
+            return self._send(404, {"ok": False, "error": "Not found"})
+        except Exception as e:
+            return self._send(500, {"ok": False, "error": str(e)})
+
+    # ── POST ───────────────────────────────────────────────────
+    def do_POST(self):
+        if not self._trusted(True):
+            return self._send(403, {"ok": False, "error": "Forbidden"})
+        path = self.path.split("?")[0]
+        try:
+            body, raw = self._body()
+        except Exception as e:
+            return self._send(400, {"ok": False, "error": str(e)})
+        try:
+            if path == "/api/settings":
+                s = apply_settings_update(body)
+                return self._send(200, {"ok": True, "settings": public_settings(s),
+                                        "restart_needed": BOT.is_running()})
+            if path == "/api/test_keys":
+                s = load_settings()
+                key = str(body.get("alpaca_api_key") or "").strip() or s["alpaca_api_key"]
+                sec = str(body.get("alpaca_secret_key") or "").strip() or s["alpaca_secret_key"]
+                mode = body.get("trading_mode") if body.get("trading_mode") in ("paper", "live") \
+                    else s["trading_mode"]
+                return self._send(200, test_alpaca_keys(key, sec, mode))
+            if path == "/api/generate_passphrase":
+                return self._send(200, {"ok": True, "passphrase": secrets.token_urlsafe(24)})
+            if path == "/api/bot/start":
+                BOT.start()
+                return self._send(200, {"ok": True, "status": BOT.status()})
+            if path == "/api/bot/stop":
+                BOT.stop()
+                return self._send(200, {"ok": True, "status": BOT.status()})
+            if path == "/api/bot/restart":
+                BOT.stop()
+                BOT.start(reason="restarted from dashboard")
+                return self._send(200, {"ok": True, "status": BOT.status()})
+            if path in _PROXY_POST:
+                status, resp = self._proxy("POST", path, raw=raw, timeout=_PROXY_POST[path])
+                if status is None:
+                    return self._send(503, {"ok": False, "error": "Bot is not running — click Start Bot"})
+                return self._send(status, resp)
+            return self._send(404, {"ok": False, "error": "Not found"})
+        except ValueError as e:
+            return self._send(400, {"ok": False, "error": str(e)})
+        except Exception as e:
+            return self._send(500, {"ok": False, "error": str(e)})
+
+    def do_OPTIONS(self):
+        self._send(405, {"ok": False})
 
-    # Replace the BAKED_HISTORY constant with fresh data
-    js = JS_TEMPLATE.replace("__BAKED_HISTORY_PLACEHOLDER__", baked_json)
-    return js
-
-
-# ═══════════════════════════════════════════════════════════════
-# JS TEMPLATE
-# (BAKED_HISTORY is injected at build time — do not edit that line)
-# ═══════════════════════════════════════════════════════════════
-
-JS_TEMPLATE = """
-// ── BAKED HISTORY ──
-// __BAKED_HISTORY_START__
-const BAKED_HISTORY = __BAKED_HISTORY_PLACEHOLDER__;
-// __BAKED_HISTORY_END__
-
-// ── STATE ──
-let chart       = null;
-let activeRange = '1h';
-let fullHistory = BAKED_HISTORY.length > 0 ? [...BAKED_HISTORY] : [];
-let liveBuf     = [];
-let lastAtr     = 0;
-// 6-month view: null = not fetched yet, [] = fetched but empty/failed.
-// Separate from fullHistory/BAKED_HISTORY on purpose — those come from the
-// bot's rolling minute-level buffer, which only retains ~1-2 weeks in
-// practice, nowhere near enough range. This is fetched fresh from
-// /daily_history (real daily bars from Alpaca) the first time the 6 Month
-// tab is opened, then cached for the rest of the session.
-let sixMonthHistory = null;
-
-// ── CHART INIT ──
-function initChart() {
-  const ctx = document.getElementById('priceChart').getContext('2d');
-  chart = new Chart(ctx, {
-    type: 'line',
-    data: { labels: [], datasets: [{ data: [],
-      borderColor: '#00e5c0', backgroundColor: 'rgba(0,229,192,0.06)',
-      borderWidth: 1.5, pointRadius: 1, pointHoverRadius: 4,
-      fill: true, tension: 0.3, spanGaps: false }] },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      animation: { duration: 200 },
-      interaction: { mode: 'index', intersect: false },
-      plugins: { legend: { display: false },
-        tooltip: { backgroundColor: '#1e2d42', titleColor: '#dde8f5',
-          bodyColor: '#4a6080', borderColor: '#1e2d42', borderWidth: 1,
-          padding: 10, callbacks: { label: c => ` $${c.parsed.y.toFixed(2)}` } } },
-      scales: {
-        x: { grid: { color: 'rgba(255,255,255,0.03)' },
-          ticks: { color: '#4a6080', font: { family: 'Space Mono', size: 10 },
-            maxRotation: 30, minRotation: 30, autoSkip: false, maxTicksLimit: 100,
-            padding: 8 } },
-        y: { grid: { color: 'rgba(255,255,255,0.03)' },
-          ticks: { color: '#4a6080', font: { family: 'Space Mono', size: 9 },
-            callback: v => `$${v.toFixed(0)}` } }
-      }
-    }
-  });
-}
-
-// ── FILTER ──
-// Merge live data from bot with BAKED_HISTORY, preserving all dates
-// Live data takes precedence for same timestamps, baked fills in gaps
-function mergeWithBaked(liveData) {
-  const todayStr = todayET();
-  const liveTodayCount = liveData ? liveData.filter(p => p.t && p.t.slice(0,10) === todayStr).length : 0;
-  console.log('mergeWithBaked: live=' + (liveData ? liveData.length : 0) + ' today=' + liveTodayCount + ' baked=' + BAKED_HISTORY.length);
-  if (!liveData || liveData.length === 0) return [...BAKED_HISTORY];
-  if (!BAKED_HISTORY || BAKED_HISTORY.length === 0) return [...liveData].sort((a,b) => a.t.localeCompare(b.t));
-
-  // Sort live data so [0] is the earliest point
-  const sortedLive = [...liveData].sort((a,b) => a.t.localeCompare(b.t));
-  const liveStart  = sortedLive[0].t;
-
-  // Keep baked points that are either:
-  //   - From a different day entirely (not covered by live data at all)
-  //   - From today but BEFORE the live session started (pre-restart history)
-  // This preserves full-day history across bot restarts.
-  const liveDates   = new Set(sortedLive.map(p => p.t.slice(0,10)));
-  const bakedToKeep = BAKED_HISTORY.filter(p => {
-    const ptDate = p.t.slice(0,10);
-    if (!liveDates.has(ptDate)) return true;   // different day — always keep
-    return p.t < liveStart;                     // same day — keep only pre-restart points
-  });
-
-  const combined = [...bakedToKeep, ...sortedLive];
-  combined.sort((a, b) => a.t.localeCompare(b.t));
-
-  // Deduplicate by timestamp
-  const seen = new Set();
-  return combined.filter(p => {
-    if (seen.has(p.t)) return false;
-    seen.add(p.t);
-    return true;
-  });
-}
-
-// Merge fullHistory (from bot) with liveBuf, deduplicating
-function mergeHistory() {
-  if (liveBuf.length === 0) return fullHistory;
-  if (fullHistory.length === 0) return liveBuf;
-  const liveStart = liveBuf[0].t;
-  const base = fullHistory.filter(p => p.t < liveStart);
-  return [...base, ...liveBuf];
-}
-
-// Get today's date string in ET timezone (YYYY-MM-DD)
-function todayET() {
-  return new Date().toLocaleString('sv-SE', {timeZone:'America/New_York'}).slice(0,10);
-}
-
-// True once bot has responded with data
-let botConnected = false;
-
-// Convert stored ET timestamp "YYYY-MM-DDTHH:MM" to epoch ms
-// Stored timestamps are ET (UTC-4 EDT). Add 4h to get UTC.
-function etToMs(t) {
-  const [date, time] = t.split('T');
-  const [y, mo, d]   = date.split('-').map(Number);
-  const [h, mn]      = time.split(':').map(Number);
-  return Date.UTC(y, mo-1, d, h+4, mn);
-}
-
-// Fetches real daily bars from the bot (which pulls them fresh from Alpaca)
-// for the 6-month chart view. Kicked off lazily the first time that tab is
-// opened, then cached in sixMonthHistory for the rest of the session.
-async function fetchSixMonthHistory() {
-  try {
-    const res  = await fetch('/daily_history', {signal: AbortSignal.timeout(20000)});
-    const data = await res.json();
-    sixMonthHistory = Array.isArray(data) ? data : [];
-  } catch (e) {
-    sixMonthHistory = [];
-    console.log('6-month history fetch failed: ' + e);
-  }
-  if (activeRange === '6m') updateChart();
-}
-
-function filterByRange(range) {
-  if (range === '6m') {
-    if (sixMonthHistory === null) {
-      fetchSixMonthHistory();  // async — updateChart() re-runs once it resolves
-      return [];
-    }
-    return sixMonthHistory;
-  }
-
-  const merged = mergeHistory();
-  if (!merged.length) return [];
-
-  if (range === '1m') {
-    // Last 30 trading days — weekends excluded
-    const days  = new Set();
-    const etNow = new Date(new Date().toLocaleString('en-US', {timeZone:'America/New_York'}));
-    const cur   = new Date(etNow);
-    while (days.size < 30) {
-      if (cur.getDay() !== 0 && cur.getDay() !== 6) {
-        const y  = cur.getFullYear();
-        const mo = String(cur.getMonth()+1).padStart(2,'0');
-        const d  = String(cur.getDate()).padStart(2,'0');
-        days.add(`${y}-${mo}-${d}`);
-      }
-      cur.setDate(cur.getDate() - 1);
-    }
-    // For 1 month: condense to open/close per day only
-    const inRange = merged.filter(p => days.has(p.t.slice(0,10)));
-    return condenseOpenClose(inRange);
-  }
-
-  if (range === '1h') {
-    // True rolling 60-minute window, scoped to today only — never bleeds into
-    // a prior session. mergeHistory() already combines baked (JSON-seeded)
-    // history with live scan points, so if the bot restarts midday the gap is
-    // filled from baked history rather than showing a hole or falling back to
-    // a stale prior day.
-    const todayStr  = todayET();
-    const allData   = mergeHistory();
-    const todayOnly = allData.filter(p => p.t.slice(0,10) === todayStr);
-    const sorted    = [...todayOnly].sort((a,b) => a.t.localeCompare(b.t));
-    if (sorted.length === 0) return [];
-
-    // Anchor the window to the latest point we actually have for today (not
-    // wall-clock "now") so the chart still shows a full hour even if the bot
-    // has been offline for a while — it shows the last hour of real data
-    // rather than going blank because "now" has moved past all of it.
-    const latestMs = etToMs(sorted[sorted.length - 1].t);
-    const cutoffMs = latestMs - 60 * 60 * 1000;
-    const windowed = sorted.filter(p => etToMs(p.t) >= cutoffMs);
-
-    // Safety floor: if today's session just started and there's less than an
-    // hour of data yet, show everything available rather than an empty/sparse
-    // chart — same intent as before, just no longer cross-day.
-    return windowed.length > 0 ? windowed : sorted;
-  }
-
-  if (range === '1d') {
-    // Return all raw scan points for today, sorted by time
-    const todayStr = todayET();
-    const todayPts = merged.filter(p => p.t.slice(0,10) === todayStr)
-                           .sort((a,b) => a.t.localeCompare(b.t));
-    if (todayPts.length > 0) return todayPts;
-    // Fallback: most recent date in history
-    const dates = [...new Set(merged.map(p => p.t.slice(0,10)))].sort();
-    return merged.filter(p => p.t.slice(0,10) === dates[dates.length-1])
-                 .sort((a,b) => a.t.localeCompare(b.t));
-  }
-
-  if (range === '5d') {
-    const days  = new Set();
-    const etNow = new Date(new Date().toLocaleString('en-US', {timeZone:'America/New_York'}));
-    const cur   = new Date(etNow);
-    while (days.size < 5) {
-      if (cur.getDay() !== 0 && cur.getDay() !== 6) {
-        const y  = cur.getFullYear();
-        const mo = String(cur.getMonth()+1).padStart(2,'0');
-        const d  = String(cur.getDate()).padStart(2,'0');
-        days.add(`${y}-${mo}-${d}`);
-      }
-      cur.setDate(cur.getDate() - 1);
-    }
-    return merged.filter(p => days.has(p.t.slice(0,10)));
-  }
-
-  return merged.slice(-60);
-}
-
-// Convert a stored ET timestamp "YYYY-MM-DDTHH:MM" to a CT time string "HH:MM CT"
-// CT = ET - 1 hour (CDT in summer, CST in winter — browser handles DST automatically)
-function etToCT(t) {
-  const [datePart, timePart] = t.split('T');
-  const [h, mn] = timePart.split(':').map(Number);
-  // Parse as ET (UTC-4 EDT / UTC-5 EST) then display in CT
-  const etDate = new Date(`${datePart}T${String(h).padStart(2,'0')}:${String(mn).padStart(2,'0')}:00-04:00`);
-  return etDate.toLocaleTimeString('en-US', {
-    timeZone: 'America/Chicago', hour: '2-digit', minute: '2-digit', hour12: false
-  }) + ' CT';
-}
-
-const MONTH_ABBR = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-
-function fmtLabel(t, range) {
-  const [datePart, timePart] = t.split('T');
-  const [y, mo, d] = datePart.split('-');
-
-  if (range === '6m') return MONTH_ABBR[parseInt(mo, 10) - 1];
-  if (range === '5d' || range === '1m') return `${mo}/${d}`;
-
-  return etToCT(t);
-}
-
-// Determine which points should show an x-axis label based on range
-function shouldShowLabel(p, i, pts, range) {
-  if (range === '6m') {
-    // /daily_history points are plain "YYYY-MM-DD" (no time component) —
-    // label the first point of each new calendar month.
-    if (i === 0) return true;
-    return pts[i-1].t.slice(0,7) !== p.t.slice(0,7);
-  }
-
-  const [datePart, timePart] = p.t.split('T');
-  const [h, mn] = timePart.split(':').map(Number);
-  const minOfDay = h * 60 + mn;
-
-  if (range === '1h') {
-    if (pts.length <= 12) return true;
-    const etDate  = new Date(datePart + 'T' + String(h).padStart(2,'0') + ':' + String(mn).padStart(2,'0') + ':00-04:00');
-    return etDate.getMinutes() % 10 === 0;
-  }
-  if (range === '1d') {
-    // For today: shouldShowLabel not used — we build fixed hourly grid instead
-    return true;
-  }
-  if (range === '5d') {
-    // Label the first data point of each trading day
-    if (i === 0) return true;
-    return pts[i-1].t.slice(0,10) !== p.t.slice(0,10);
-  }
-  if (range === '1m') {
-    // Label the first data point of each trading day
-    if (i === 0) return true;
-    return pts[i-1].t.slice(0,10) !== p.t.slice(0,10);
-  }
-  return false;
-}
-
-// ── RENDER CHART ──
-function updateChart() {
-  if (!chart) return;
-  const pts = filterByRange(activeRange);
-  const ptsLen = Array.isArray(pts) ? pts.length : (pts.points ? pts.points.length : 0);
-  console.log('updateChart: range=' + activeRange + ' pts=' + ptsLen + ' fullHistory=' + fullHistory.length);
-  if (ptsLen === 0 && !pts._prebuilt) {
-    document.getElementById('range-hint').textContent =
-      activeRange === '6m' && sixMonthHistory === null
-        ? 'Loading 6-month history...'
-        : 'No data for this period — try 1 Month';
-    chart.data.labels = [];
-    chart.data.datasets[0].data = [];
-    chart.update('none');
-    return;
-  }
-
-  let displayPts, labels;
-  if (activeRange === '1h') {
-    // Last 60 scan points — label every 10th point with the ET time from the data
-    displayPts = pts;
-    labels = displayPts.map((p, i) => {
-      if (i === 0 || i % 10 === 0 || i === displayPts.length - 1) {
-        const timePart = p.t.includes('T') ? p.t.slice(11) : p.t;
-        return timePart + ' ET';
-      }
-      return '';
-    });
-  } else if (activeRange === '5d') {
-    displayPts = condenseKillZones(pts);
-    labels = displayPts.map((p,i) =>
-      shouldShowLabel(p, i, displayPts, activeRange) ? fmtLabel(p.t, activeRange) : '');
-  } else if (activeRange === '1d') {
-    // All points for today. Label every 30 min using ET timestamp from data directly.
-    displayPts = pts;
-    let lastLabelMin = -999;
-    labels = displayPts.map((p, i) => {
-      const timePart = p.t.includes('T') ? p.t.slice(11) : p.t;
-      const [h, m]   = timePart.split(':').map(Number);
-      const minOfDay = h * 60 + m;
-      const isFirst  = i === 0;
-      const isLast   = i === displayPts.length - 1;
-      const slot30   = Math.floor(minOfDay / 30) * 30;
-      if (isFirst || isLast || (slot30 !== Math.floor(lastLabelMin / 30) * 30 && minOfDay - lastLabelMin >= 20)) {
-        lastLabelMin = minOfDay;
-        return timePart + ' ET';
-      }
-      return '';
-    });
-  } else {
-    displayPts = pts;
-    labels = displayPts.map((p,i) =>
-      shouldShowLabel(p, i, displayPts, activeRange) ? fmtLabel(p.t, activeRange) : '');
-  }
-
-  chart.data.labels = labels;
-  chart.data.datasets[0].data = displayPts.map(p => p.p);
-  chart.update('none');
-  const lo = Math.min(...displayPts.map(p=>p.p));
-  const hi = Math.max(...displayPts.map(p=>p.p));
-  document.getElementById('range-hint').textContent =
-    displayPts.length + ' points · $' + lo.toFixed(2) + ' – $' + hi.toFixed(2);
-}
-
-// For 1 Hour tab: fixed 60-min rolling window, last known price held flat
-function build1HourGrid(allPts) {
-  const now    = new Date();
-  const points = [];
-  const labels = [];
-
-  // Build 12 x 5-min slots for the last 60 minutes
-  for (let i = 11; i >= 0; i--) {
-    const slotTime = new Date(now.getTime() - i * 5 * 60000);
-
-    // Display time in CT to match user's timezone
-    const etStr  = slotTime.toLocaleTimeString('en-US', {
-      timeZone: 'America/Chicago', hour: '2-digit', minute: '2-digit', hour12: false
-    });
-
-    // Find last known price at or before this slot (compare epoch ms)
-    const slotMs = slotTime.getTime();
-    const before = allPts.filter(p => etToMs(p.t) <= slotMs);
-    const lastP  = before.length > 0 ? before[before.length-1].p : null;
-
-    points.push({ t: etStr, p: lastP });
-    labels.push(etStr);   // label every point
-  }
-
-  return { _prebuilt: true, points, labels };
-}
-
-// For 1 Month tab: reduce to 2 points per day (first + last = open/close)
-function condenseOpenClose(pts) {
-  const byDate = {};
-  pts.forEach(p => {
-    const d = p.t.slice(0,10);
-    if (!byDate[d]) byDate[d] = [];
-    byDate[d].push(p);
-  });
-  const result = [];
-  Object.keys(byDate).sort().forEach(date => {
-    const day = byDate[date].sort((a,b) => a.t.localeCompare(b.t));
-    result.push(day[0]);  // open
-    if (day.length > 1) result.push(day[day.length-1]);  // close
-  });
-  return result;
-}
-
-// For Today tab: build fixed hourly grid using ET hour labels
-// Each hour slot shows the last known price at or before that time
-// v4.12: removed CDT hardcoding (cdtH+1) — now reads ET hour directly from stored timestamps
-function buildHourlyGrid(pts) {
-  const now    = new Date();
-  const etNow  = new Date(now.toLocaleString('en-US', {timeZone: 'America/New_York'}));
-  const maxETH = Math.min(etNow.getHours() + (etNow.getMinutes() >= 30 ? 1 : 0), 16);
-
-  const hourSlots = [];
-  for (let h = 9; h <= maxETH; h++) hourSlots.push(h);
-
-  const points = [];
-  const labels = [];
-  const sorted = [...pts].sort((a,b) => a.t.localeCompare(b.t));
-
-  hourSlots.forEach(etH => {
-    // Stored timestamps are "YYYY-MM-DDTHH:MM" in ET — read hour directly
-    const hourPts = sorted.filter(p => parseInt(p.t.slice(11, 13), 10) === etH);
-    const lastP   = hourPts.length > 0 ? hourPts[hourPts.length-1].p : null;
-
-    // Label in ET (matches stored data format)
-    const label = String(etH).padStart(2,'0') + ':00 ET';
-    points.push({ t: label, p: lastP });
-    labels.push(label);
-  });
-
-  return { points, labels };
-}
-
-// For 5 Days tab: condense each day into 3 kill zone averages
-// Stored timestamps may be in local time (CDT = ET+1hr) so we
-// convert by checking the kz field stored with each point, or
-// fall back to dividing the day into thirds
-function condenseKillZones(pts) {
-  const byDate = {};
-  pts.forEach(p => {
-    const date = p.t.slice(0,10);
-    if (!byDate[date]) byDate[date] = [];
-    byDate[date].push(p);
-  });
-
-  const result = [];
-  Object.keys(byDate).sort().forEach(date => {
-    const dayPts = byDate[date];
-
-    // Try using stored kz field first (new points have this)
-    const withKz = dayPts.filter(p => p.kz);
-    if (withKz.length > 0) {
-      const kzGroups = {};
-      withKz.forEach(p => {
-        if (!kzGroups[p.kz]) kzGroups[p.kz] = [];
-        kzGroups[p.kz].push(p);
-      });
-      // Also group points with no kz tag as their own bucket
-      const noKz = dayPts.filter(p => !p.kz);
-      if (noKz.length > 0) kzGroups['session'] = noKz;
-
-      Object.keys(kzGroups).sort().forEach((kz, ki) => {
-        const kzPts = kzGroups[kz];
-        const avgP  = kzPts.reduce((s,p) => s+p.p, 0) / kzPts.length;
-        // v4.12: safe time mapping — only 3 named kill zones; 'session' group gets 10:00
-        const kzTimes = {'09:30':'09:30','12:00':'12:00','14:00':'14:00','session':'10:00'};
-        const kzTime  = kzTimes[kz] || '10:00';
-        result.push({ t: `${date}T${kzTime}`, p: Math.round(avgP*100)/100, kz });
-      });
-    } else {
-      // Fall back: split day into thirds as AM/NOON/PM
-      const third = Math.ceil(dayPts.length / 3);
-      const slots = [
-        { pts: dayPts.slice(0, third),          t: `${date}T09:30`, kz: 'AM' },
-        { pts: dayPts.slice(third, third*2),     t: `${date}T12:00`, kz: 'NOON' },
-        { pts: dayPts.slice(third*2),            t: `${date}T14:00`, kz: 'PM' },
-      ];
-      slots.forEach(slot => {
-        if (slot.pts.length > 0) {
-          const avgP = slot.pts.reduce((s,p) => s+p.p, 0) / slot.pts.length;
-          result.push({ t: slot.t, p: Math.round(avgP*100)/100, kz: slot.kz });
-        }
-      });
-    }
-  });
-  return result;
-}
-
-// ── TABS ──
-document.querySelectorAll('.range-tab').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('.range-tab').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    activeRange = btn.dataset.range;
-    updateChart();
-  });
-});
-
-// ── FETCH ──
-async function fetchData() {
-  try {
-    const res  = await fetch('/data', {signal: AbortSignal.timeout(4000)});
-    const data = await res.json();
-    document.getElementById('conn-banner').style.display = 'none';
-    document.getElementById('live-dot').className = 'dot live';
-    document.getElementById('live-label').textContent = 'LIVE';
-    botConnected = true;
-    try {
-      updateUI(data);
-    } catch(uiErr) {
-      console.error('updateUI crashed:', uiErr.message, uiErr.stack);
-    }
-  } catch(e) {
-    console.error('fetchData failed:', e.message);
-    document.getElementById('live-dot').className = 'dot error';
-    document.getElementById('live-label').textContent = 'Offline';
-    if (fullHistory.length > 0) {
-      document.getElementById('status-text').textContent =
-        'Bot offline — showing saved history (' + fullHistory.length + ' points)';
-      document.getElementById('conn-banner').style.display = 'none';
-    } else {
-      document.getElementById('conn-banner').style.display = 'block';
-    }
-    updateChart();
-  }
-}
-
-// ── UPDATE UI ──
-function updateUI(d) {
-  document.getElementById('status-text').textContent = d.status || '—';
-  document.getElementById('status-meta').textContent =
-    (d.timestamp||'') + ' · ' + (d.last_candles||0) + ' candles · ' + (d.fetch_errors||0) + ' errors';
-
-  // v4.78: the manual-trade modal's entry price used to be kept "live" from
-  // here — d.last_price, which is state["last_price"] from a 5-minute candle
-  // close in the bot's background refresh loop. That can lag the true price
-  // by minutes (confirmed live: modal showed $227.70, the order validation's
-  // fresh api.get_latest_trade() tick was $226.32 moments later — a real gap,
-  // not a stale display glitch). The modal now runs its own poller against
-  // /live_price (see startLivePricePolling()), the same source
-  // /manual_trade validates against, so this block only keeps ATR synced —
-  // it no longer touches m-entry/m-price-hint at all, to avoid two different
-  // price sources fighting over the same field.
-  if (lastAtr !== d.last_atr) { lastAtr = d.last_atr || 0; }
-
-  const kzT = [['09:30','11:00'],['12:00','13:00'],['14:00','15:55']];
-  const et  = new Date().toLocaleTimeString('en-US',{timeZone:'America/New_York',hour12:false});
-  const [h,m] = et.split(':').map(Number); const etM = h*60+m;
-  kzT.forEach(([s,e],i) => {
-    const [sh,sm]=s.split(':').map(Number),[eh,em]=e.split(':').map(Number);
-    const el = document.getElementById('kz-'+i);
-    const inKz = etM>=sh*60+sm && etM<eh*60+em, past = etM>=eh*60+em;
-    el.className = 'kz-slot'+(inKz?' active':past?' passed':'');
-    el.textContent = (inKz?'▶ ':'')+s+'–'+e+' ET';
-  });
-
-  // The bot sends state["price_history"] which already contains the full merged
-  // history (JSON seed + live points). Just use it directly, supplementing only
-  // with baked dates that the bot's history doesn't cover at all.
-  if (d.price_history && d.price_history.length > 0) {
-    try {
-      const live = d.price_history;
-      const liveDates  = new Set(live.map(p => p.t.slice(0,10)));
-      const liveFirst  = live.reduce((min, p) => p.t < min ? p.t : min, live[0].t);
-      // Keep baked points that are either:
-      // (a) from a date not covered by live data at all, OR
-      // (b) from the same day but BEFORE the first live point (pre-restart history)
-      const bakedExtra = BAKED_HISTORY.filter(p => {
-        if (!liveDates.has(p.t.slice(0,10))) return true;  // different day
-        return p.t < liveFirst;  // same day, pre-restart
-      });
-      const combined = [...bakedExtra, ...live].sort((a,b) => a.t.localeCompare(b.t));
-      const seen = new Set();
-      fullHistory = combined.filter(p => {
-        if (seen.has(p.t)) return false;
-        seen.add(p.t);
-        return true;
-      });
-      updateChart();
-    } catch(e) {
-      console.error('history merge failed:', e);
-    }
-  }
-
-  const price = d.last_price || 0;
-  if (price > 0) {
-    document.getElementById('val-price').textContent = '$'+price.toFixed(2);
-    document.getElementById('sub-price').textContent = 'Scanned: '+(d.last_scan_time||'—');
-    // Use ET timestamp to match baked history format
-    const etStr = new Date().toLocaleString('sv-SE', {timeZone:'America/New_York'}).slice(0,16).replace(' ','T');
-    const todayStr = etStr.slice(0,10);
-    // Day-rollover guard: liveBuf is capped by COUNT not by date, so if the
-    // dashboard stays open across a session boundary it can silently mix
-    // yesterday's last points with today's first points. Drop anything not
-    // from today before appending.
-    if (liveBuf.length > 0 && liveBuf[0].t.slice(0,10) !== todayStr) {
-      liveBuf = liveBuf.filter(p => p.t.slice(0,10) === todayStr);
-    }
-    const lastPt = liveBuf[liveBuf.length-1];
-    if (!lastPt || lastPt.t !== etStr) {
-      liveBuf.push({t: etStr, p: price});
-    } else {
-      liveBuf[liveBuf.length-1].p = price; // update same-minute point
-    }
-    if (liveBuf.length > 120) liveBuf.shift();
-    updateChart();
-  }
-
-  lastAtr = d.last_atr || 0;
-  if (d.trail_activated) document.getElementById('card-pnl').className = 'stat-card yellow';
-
-  const tr = d.last_trend||'neutral';
-  document.getElementById('val-trend').textContent = tr.toUpperCase();
-  document.getElementById('val-trend').className = 'stat-value '+(tr==='bullish'?'up':tr==='bearish'?'down':'flat');
-  document.getElementById('card-trend').className = 'stat-card '+(tr==='bullish'?'':tr==='bearish'?'red':'yellow');
-
-  const qq = d.last_qqq||'neutral';
-  document.getElementById('val-qqq').textContent = qq.toUpperCase();
-  document.getElementById('val-qqq').className = 'stat-value '+(qq==='bullish'?'up':qq==='bearish'?'down':'flat');
-
-  document.getElementById('val-fvgs').textContent = d.fvgs_today||0;
-  document.getElementById('sub-fvgs').textContent = 'Best score: '+(d.best_score||0)+'/9';
-
-  const eq  = d.equity||0;
-  const bod = d.bod_equity||0;
-  const equityDayPnl = (eq > 0 && bod > 0) ? eq - bod : (d.daily_pnl||0);
-  const equityPnlSign = equityDayPnl >= 0 ? '+' : '';
-  document.getElementById('val-equity').textContent = eq>0 ? '$'+eq.toLocaleString('en-US',{maximumFractionDigits:0}) : '—';
-  const subEqEl = document.getElementById('sub-equity');
-  if (subEqEl) {
-    subEqEl.textContent = eq>0 && bod>0
-      ? 'Day P&L: ' + equityPnlSign + '$' + equityDayPnl.toFixed(2)
-      : '—';
-    subEqEl.className = 'stat-sub ' + (equityDayPnl >= 0 ? 'up' : 'down');
-  }
-
-  // Strategy card
-  const strat = d.active_strategy || '—';
-  const stratEl = document.getElementById('val-strategy');
-  stratEl.textContent = strat;
-  stratEl.className = 'stat-value ' + (strat === 'FVG' ? 'up' : strat === 'VWAP' ? 'flat' : 'flat');
-  document.getElementById('sub-strategy').textContent =
-    d.last_vwap > 0 ? 'VWAP $' + d.last_vwap.toFixed(2) : (d.strategy_reason || '—');
-
-  // MTF bias card
-  const mtf = (d.mtf_bias || '—').replace('_', ' ').toUpperCase();
-  const mtfEl = document.getElementById('val-mtf');
-  mtfEl.textContent = mtf;
-  mtfEl.className = 'stat-value ' + (mtf.includes('BULL') ? 'up' : mtf.includes('BEAR') ? 'down' : 'flat');
-  document.getElementById('card-mtf').className = 'stat-card ' +
-    (mtf.includes('STRONG BULL') ? '' : mtf.includes('BULL') ? '' :
-     mtf.includes('STRONG BEAR') ? 'red' : mtf.includes('BEAR') ? 'red' : 'yellow');
-  document.getElementById('sub-mtf').textContent =
-    (d.weekly_trend ? ('W: ' + d.weekly_trend) : '') +
-    (d.monthly_trend ? (' · M: ' + d.monthly_trend) : '');
-
-  // ── Multi-trade panel ────────────────────────────────────────
-  const activeTrades = d.active_trades || (d.active_trade ? [d.active_trade] : []);
-  const closedTrade  = d.closed_trade;
-
-  // P&L stat card — sum of all open unrealized + day P&L
-  const pnlEl = document.getElementById('val-pnl');
-  const dayPnl = parseFloat(d.daily_pnl) || 0;
-  const unrealSum = activeTrades.reduce((s,t) => s + (parseFloat(t.pnl)||0), 0);
-  const displayPnl = activeTrades.length > 0 ? unrealSum : dayPnl;
-  if (displayPnl !== 0 || activeTrades.length > 0 || d.traded_today) {
-    pnlEl.textContent = (displayPnl>=0?'+':'')+'$'+displayPnl.toFixed(2);
-    pnlEl.className = 'stat-value '+(displayPnl>=0?'up':'down');
-    document.getElementById('sub-pnl').textContent =
-      activeTrades.length > 0 ? `${activeTrades.length} trade${activeTrades.length>1?'s':''} open` :
-      (closedTrade ? 'Realized ('+closedTrade.outcome+')' : 'Day P&L');
-  } else {
-    pnlEl.textContent='—'; pnlEl.className='stat-value flat';
-    document.getElementById('sub-pnl').textContent = 'No trade yet';
-  }
-
-  // Trade cards — one per active trade, stacked vertically
-  const tradeEl = document.getElementById('trade-content');
-  function renderTradeCard(trade, idx) {
-    const dir = trade.fvg_type||'';
-    const col = dir==='bullish'?'var(--win)':'var(--loss)';
-    const pnl = parseFloat(trade.pnl)||0;
-    const isManual = trade.strategy==='MANUAL';
-    const isOpen   = trade.outcome==='OPEN' || trade.outcome==null;
-    const stratLabel = isManual ? '📋 MANUAL' : `🤖 ${trade.strategy||'BOT'}`;
-    // v4.94: SWING-6M can now carry for multiple days (see swing_max_hold_days) —
-    // flag it explicitly instead of leaving a stale-looking timestamp unexplained.
-    const daysOpen = trade.days_open || 0;
-    const daysBadge = daysOpen > 0 ? ` <span style="color:var(--yellow)">(${daysOpen}d open)</span>` : '';
-    return `<div class="trade-card" id="trade-card-${idx}" style="border:1px solid var(--border);border-radius:6px;padding:12px;margin-bottom:10px;">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-        <span style="font-size:.65rem;color:var(--muted);font-family:'Space Mono',monospace">${stratLabel}</span>
-        <span style="font-size:.65rem;color:var(--muted);font-family:'Space Mono',monospace">${trade.opened_at||''}${daysBadge}</span>
-      </div>
-      <div class="trade-row"><span class="trade-key">Direction</span><span class="trade-val" style="color:${col}">${dir==='bullish'?'▲ LONG':'▼ SHORT'}</span></div>
-      <div class="trade-row"><span class="trade-key">Entry</span><span class="trade-val">$${(trade.entry||0).toFixed(2)}</span></div>
-      <div class="trade-row"><span class="trade-key">Stop</span><span class="trade-val" style="color:${
-        trade.trail_active ? 'var(--win)' :
-        (trade.stop||0).toFixed(2) === (trade.entry||0).toFixed(2) ? 'var(--yellow)' :
-        'var(--loss)'
-      }">${
-        trade.trail_active ? '▲ TRAIL $' + (trade.stop||0).toFixed(2) :
-        (trade.stop||0).toFixed(2) === (trade.entry||0).toFixed(2) ? 'BE $' + (trade.stop||0).toFixed(2) :
-        '$' + (trade.stop||0).toFixed(2)
-      }</span></div>
-      <div class="trade-row"><span class="trade-key">Target</span><span class="trade-val" style="color:var(--win)">$${(trade.target||0).toFixed(2)}</span></div>
-      <div class="trade-row"><span class="trade-key">Qty</span><span class="trade-val">${trade.qty||'—'}</span></div>
-      <div class="trade-row"><span class="trade-key">Status</span><span class="trade-val" style="color:${isOpen?'var(--yellow)':trade.outcome==='WIN'?'var(--win)':'var(--loss)'}">${trade.outcome||'OPEN'}</span></div>
-      <div class="trade-row"><span class="trade-key">P&L</span><span class="trade-val" style="color:${pnl>=0?'var(--win)':'var(--loss)'}">${(pnl>=0?'+':'')+'$'+pnl.toFixed(2)}</span></div>
-      ${isManual && isOpen ? `<button class="close-trade-btn" style="width:100%;margin-top:8px;padding:6px;font-size:.7rem;" onclick="openCloseModalFor('${trade.id||''}')">✕ Close This Trade</button>` : ''}
-    </div>`;
-  }
-
-  if (activeTrades.length > 0) {
-    document.querySelector('.trade-panel').querySelector('.card-title').textContent =
-      `Active Trades (${activeTrades.length})`;
-    tradeEl.innerHTML = activeTrades.map((t,i) => renderTradeCard(t,i)).join('');
-  } else if (closedTrade) {
-    document.querySelector('.trade-panel').querySelector('.card-title').textContent = 'Last Trade';
-    tradeEl.innerHTML = renderTradeCard(closedTrade, 0);
-  } else {
-    document.querySelector('.trade-panel').querySelector('.card-title').textContent = 'Active Trade';
-    tradeEl.innerHTML='<div class="trade-empty"><div class="icon">⏳</div><div>'+(d.traded_today?'Trade complete':'No active trade')+'</div></div>';
-  }
-
-  const fvgEl = document.getElementById('fvg-items');
-  if (d.all_fvgs && d.all_fvgs.length > 0) {
-    fvgEl.innerHTML = d.all_fvgs.map(f => `
-      <div class="fvg-item ${f.type}">
-        <span class="fvg-badge ${f.type}">${f.type==='bullish'?'▲ LONG':'▼ SHORT'}</span>
-        <div class="fvg-details"><strong>${f.time}</strong> · $${f.size} gap · entry $${f.entry_zone}
-        <div style="font-size:.68rem;color:var(--muted);margin-top:2px">${f.notes}</div></div>
-        <div class="fvg-score"><div class="score-pips">${Array.from({length:9},(_,i)=>`<div class="pip ${i<f.score?'on':'off'}"></div>`).join('')}</div>
-        <div style="font-family:'Space Mono',monospace;font-size:.62rem;color:var(--muted);text-align:right;margin-top:3px">${f.score}/9</div></div>
-      </div>`).join('');
-  } else {
-    fvgEl.innerHTML='<div class="fvg-empty">No FVGs detected yet today</div>';
-  }
-
-  const logEl = document.getElementById('log-inner');
-  if (d.log && d.log.length > 0) {
-    logEl.innerHTML = d.log.map(ev=>`
-      <div class="log-entry">
-        <span class="log-time">${ev.time.split(' ')[0]}</span>
-        <span class="log-level ${ev.level}">${ev.level}</span>
-        <span class="log-msg">${ev.message}</span>
-      </div>`).join('');
-  }
-}
-
-// ── MANUAL TRADE ──
-let modalDir=null, modalManaged=true, modalTrail=false;
-let livePricePollId=null;
-// v4.78: fetches from /live_price (a fresh api.get_latest_trade() tick —
-// the exact same source /manual_trade validates against), NOT /data's
-// last_price (a 5-min candle close that can lag the true price by minutes —
-// confirmed live: modal showed $227.70 from last_price while the real
-// current price used for validation was $226.32). Showing the user the
-// same number the order will actually be checked against is the whole
-// point — anything else can look "live" and still be wrong.
-async function fetchLivePriceForModal(){
-  try {
-    const res  = await fetch('/live_price', {signal: AbortSignal.timeout(2000)});
-    const data = await res.json();
-    if (data.price > 0) {
-      document.getElementById('m-entry').value = data.price.toFixed(2);
-      document.getElementById('m-price-hint').textContent = 'Live price (last trade tick) — updated just now';
-      if (document.getElementById('m-atr').checked) updateAtrPreview();
-      updateBracketHint();
-    } else {
-      document.getElementById('m-price-hint').textContent = 'Could not fetch a live tick: ' + (data.error || 'unknown error');
-    }
-  } catch(e) {
-    document.getElementById('m-price-hint').textContent = 'Could not fetch live price — bot unreachable';
-  }
-}
-function startLivePricePolling(){
-  stopLivePricePolling();
-  fetchLivePriceForModal();
-  livePricePollId = setInterval(fetchLivePriceForModal, 4000);
-}
-function stopLivePricePolling(){
-  if (livePricePollId) { clearInterval(livePricePollId); livePricePollId=null; }
-}
-async function openModal(){
-  try {
-    const res  = await fetch('/data', {signal: AbortSignal.timeout(2000)});
-    const data = await res.json();
-    if (data.last_atr) lastAtr = data.last_atr;
-  } catch(e) { /* non-fatal — ATR preview just won't be available yet */ }
-  document.getElementById('m-trail').checked = false;
-  modalTrail = false;
-  document.getElementById('trail-hint').textContent = '';
-  document.getElementById('trail-row').style.display = 'flex';
-  updateAtrHint();
-  document.getElementById('modal-backdrop').classList.remove('hidden');
-  startLivePricePolling();
-}
-function closeModal(){ document.getElementById('modal-backdrop').classList.add('hidden'); clearFb(); stopLivePricePolling(); }
-function closeModalOutside(e){ if(e.target===document.getElementById('modal-backdrop')) closeModal(); }
-function setDir(d){ modalDir=d; document.getElementById('btn-long').className='dir-btn '+(d==='bullish'?'selected-long':''); document.getElementById('btn-short').className='dir-btn '+(d==='bearish'?'selected-short':''); updateBracketHint(); }
-// Live guidance for the manual Stop/Target fields — this exists because a
-// real user hit the server's bracket-check rejection (stop/target on the
-// wrong side of the live price for a SHORT) after typing values manually,
-// and asked why, since the displayed live price looked current. The price
-// WAS current — the values they typed just weren't on the right side of it
-// for the direction they picked (for a SHORT, target must be BELOW price
-// and stop must be ABOVE; it's the reverse of a LONG). Nothing in the form
-// said that. This shows the actual requirement live, and colors the fields
-// once both are filled in, instead of only finding out after submitting.
-function updateBracketHint(){
-  const hintEl = document.getElementById('m-bracket-hint');
-  if(!hintEl) return;
-  const entry = parseFloat(document.getElementById('m-entry').value) || 0;
-  if(!modalDir || entry <= 0){ hintEl.textContent=''; return; }
-  const below = modalDir === 'bullish' ? 'Stop' : 'Target';
-  const above = modalDir === 'bullish' ? 'Target' : 'Stop';
-  hintEl.textContent = 'For a ' + (modalDir==='bullish'?'LONG':'SHORT') + ': ' + below +
-    ' must be below $' + entry.toFixed(2) + ' · ' + above + ' must be above $' + entry.toFixed(2);
-  const stop   = parseFloat(document.getElementById('m-stop').value);
-  const target = parseFloat(document.getElementById('m-target').value);
-  let ok = true;
-  if(stop && target){
-    ok = modalDir === 'bullish' ? (stop < entry && entry < target) : (target < entry && entry < stop);
-  }
-  hintEl.style.color = ok ? 'var(--muted)' : 'var(--red)';
-}
-let atrMult = 1.0;
-function setAtrMult(m){
-  atrMult = m;
-  document.querySelectorAll('.atr-mult-btn').forEach(b => {
-    b.classList.toggle('active', parseFloat(b.textContent) === m);
-  });
-  updateAtrPreview();
-}
-function updateAtrPreview(){
-  const preview = document.getElementById('atr-preview');
-  if(!preview) return;
-  if(lastAtr <= 0){ preview.textContent = ''; return; }
-  const entry    = parseFloat(document.getElementById('m-entry').value) || 0;
-  const stopDist = atrMult * lastAtr;
-  const tgtDist  = stopDist * 1.5;
-  if(entry > 0 && modalDir){
-    const stop   = modalDir === 'bullish' ? (entry - stopDist).toFixed(2) : (entry + stopDist).toFixed(2);
-    const target = modalDir === 'bullish' ? (entry + tgtDist).toFixed(2)  : (entry - tgtDist).toFixed(2);
-    preview.textContent = 'ATR $' + lastAtr.toFixed(3) + ' | Stop: $' + stop + ' | Target: $' + target + '  (risk $' + stopDist.toFixed(2) + ', reward $' + tgtDist.toFixed(2) + ')';
-  } else {
-    preview.textContent = 'ATR $' + lastAtr.toFixed(3) + ' stop dist $' + stopDist.toFixed(2) + ', target dist $' + tgtDist.toFixed(2);
-  }
-}
-function toggleAtr(){
-  const checked = document.getElementById('m-atr').checked;
-  document.getElementById('manual-stop-target').style.display = checked ? 'none' : 'block';
-  document.getElementById('atr-mult-row').style.display = checked ? 'block' : 'none';
-  updateAtrHint();
-  if(checked) updateAtrPreview();
-}
-function updateAtrHint(){ document.getElementById('atr-hint').textContent = lastAtr > 0 ? ' (ATR: $' + lastAtr.toFixed(3) + ')' : ''; }
-function toggleTrail(){
-  modalTrail = document.getElementById('m-trail').checked;
-  const hint = document.getElementById('trail-hint');
-  hint.textContent = modalTrail ? 'Stop moves to breakeven at 1:1R, then trails at 2:1R' : '';
-}
-function setManaged(v){
-  modalManaged=v;
-  document.getElementById('btn-managed').className='managed-btn'+(v?' selected-managed':'');
-  document.getElementById('btn-logonly').className='managed-btn'+(v?'':' selected-managed');
-  // Only show trail option when managed is on
-  document.getElementById('trail-row').style.display = v ? 'flex' : 'none';
-  if (!v) { document.getElementById('m-trail').checked = false; modalTrail = false; }
-}
-async function submitManualTrade(){
-  const btn=document.getElementById('submit-btn'); clearFb();
-  if(!modalDir) return showErr('Select a direction');
-  const entry=parseFloat(document.getElementById('m-entry').value), qty=parseInt(document.getElementById('m-qty').value);
-  if(!entry||entry<=0) return showErr('No live price yet — close and reopen the trade modal');
-  if(!qty||qty<=0) return showErr('Enter a valid quantity');
-  const useAtr=document.getElementById('m-atr').checked; let stop=0,target=0;
-  if(!useAtr){
-    stop=parseFloat(document.getElementById('m-stop').value); target=parseFloat(document.getElementById('m-target').value);
-    if(!stop) return showErr('Enter stop'); if(!target) return showErr('Enter target');
-    // Mirrors the server's own bracket check (nvda_autotrader.py /manual_trade
-    // handler) so this is caught instantly instead of round-tripping to find
-    // out — same rule, same message. The live price shown here can still
-    // move by the time the server re-checks against its own fresh quote, so
-    // the server check stays authoritative; this is just an earlier catch
-    // for the common case (values typed on the wrong side of price for the
-    // chosen direction), not a replacement for it.
-    const bracketOk = modalDir==='bullish' ? (stop<entry && entry<target) : (target<entry && entry<stop);
-    if(!bracketOk){
-      const need = modalDir==='bullish' ? 'stop < price < target' : 'target < price < stop';
-      return showErr('Live price is $'+entry.toFixed(2)+' — your stop ($'+stop.toFixed(2)+') and target ($'+target.toFixed(2)+
-        ') do not bracket it correctly for a '+(modalDir==='bullish'?'LONG':'SHORT')+' (need '+need+').');
-    }
-  }
-  btn.disabled=true; btn.textContent='Entering...';
-  try{
-    const res=await fetch('/manual_trade',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({direction:modalDir,entry,stop,target,qty,managed:modalManaged,use_atr:useAtr,atr_mult:atrMult,use_trail:modalTrail})});
-    const data=await res.json();
-    if(data.ok){ document.getElementById('modal-success').style.display='block'; document.getElementById('modal-success').textContent='✓ '+data.message; setTimeout(closeModal,1800); }
-    else showErr(data.error||'Failed');
-  }catch(e){ showErr('Bot disconnected'); }
-  btn.disabled=false; btn.textContent='Enter Trade';
-}
-function showErr(msg){ const el=document.getElementById('modal-error'); el.textContent='⚠ '+msg; el.style.display='block'; }
-function clearFb(){ ['modal-error','modal-success','close-error'].forEach(id=>{ const el=document.getElementById(id); if(el) el.style.display='none'; }); }
-let closeTradeOrderId = '';
-function openCloseModalFor(orderId){ closeTradeOrderId=orderId||''; clearFb(); document.getElementById('c-pnl').value=''; document.getElementById('close-modal-backdrop').classList.remove('hidden'); }
-function openCloseModal(){ openCloseModalFor(''); }
-function closeCloseModal(e){ if(!e||e.target===document.getElementById('close-modal-backdrop')) document.getElementById('close-modal-backdrop').classList.add('hidden'); }
-async function submitClose(){
-  const pnl=parseFloat(document.getElementById('c-pnl').value)||0;
-  try{ const res=await fetch('/close_manual_trade',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pnl, order_id: closeTradeOrderId})}); const data=await res.json(); if(data.ok) closeCloseModal(); else{ document.getElementById('close-error').style.display='block'; document.getElementById('close-error').textContent='⚠ '+data.error; } }catch(e){ document.getElementById('close-error').style.display='block'; document.getElementById('close-error').textContent='⚠ Bot disconnected'; }
-}
-
-// ── CHART SIZE WATCHDOG ──
-// v4.76 fix: Chart.js can measure its container before the CSS grid
-// (.main-grid{grid-template-columns:1fr 340px}) finishes its layout pass on
-// first load, locking the canvas to a stale/tiny size — reproduced live:
-// canvas stuck at 300x260 instead of the chart-wrap container's real
-// ~575px+ width, making the price chart render tiny in a mostly-empty card.
-// Confirmed in testing that neither a window 'resize' event, nor
-// chart.resize(), nor even chart.resize(width, height) with explicit
-// correct numbers corrects an already-stuck instance — Chart.js keeps
-// redrawing at its originally-measured size regardless. Only destroying and
-// recreating the chart instance reliably fixes it. Runs once, shortly after
-// load, and only when the canvas doesn't actually match its container —
-// harmless no-op in the common case where sizing was already correct.
-function fixChartSizeIfStuck() {
-  const wrap = document.querySelector('.chart-wrap');
-  const cv   = document.getElementById('priceChart');
-  if (!chart || !wrap || !cv) return;
-  const wrapWidth = wrap.getBoundingClientRect().width;
-  const cvWidth   = parseInt(cv.getAttribute('width') || '0', 10);
-  if (wrapWidth > 0 && Math.abs(wrapWidth - cvWidth) > 20) {
-    console.log('Chart size mismatch (wrap=' + wrapWidth + ' canvas=' + cvWidth + ') — recreating chart');
-    chart.destroy();
-    initChart();
-    updateChart();
-  }
-}
-
-// Re-check on browser window resize too — there was no resize handling at
-// all before, so dragging the window to a new size (or moving it to a
-// different monitor) never re-fit the chart. Debounced to avoid rebuilding
-// the chart on every pixel during a drag-resize.
-let _resizeDebounce = null;
-window.addEventListener('resize', () => {
-  clearTimeout(_resizeDebounce);
-  _resizeDebounce = setTimeout(fixChartSizeIfStuck, 250);
-});
-
-// ── START ──
-window.addEventListener('load', () => {
-  initChart();
-  updateChart();  // initial render with baked data
-  setTimeout(fixChartSizeIfStuck, 500);
-
-  // Fetch full history from bot on startup — gets today's scans immediately
-  fetch('/history', {signal: AbortSignal.timeout(4000)})
-    .then(r => r.json())
-    .then(hist => {
-      console.log('History fetch: got ' + (hist ? hist.length : 0) + ' points');
-      if (hist && hist.length > 0) {
-        // Find today's points specifically
-        const todayStr = todayET();
-        const todayPts = hist.filter(p => p.t && p.t.slice(0,10) === todayStr);
-        console.log('Today points in history: ' + todayPts.length + ' (today=' + todayStr + ')');
-        if (todayPts.length > 0) console.log('First today pt: ' + JSON.stringify(todayPts[0]));
-        fullHistory = mergeWithBaked(hist);
-        botConnected = true;
-        updateChart();
-      }
-    })
-    .catch(e => {
-      console.log('History fetch failed: ' + e.message);
-    });
-
-  fetchData();
-  setInterval(fetchData, 5000);
-});
-"""
-
-
-# ═══════════════════════════════════════════════════════════════
-# BUILD
-# ═══════════════════════════════════════════════════════════════
 
 def load_price_history():
-    """Load price history from JSON file, return empty list if not found."""
-    hist_file = os.path.join(os.path.dirname(__file__), PRICE_HIST_FILE)
-    if not os.path.exists(hist_file):
-        print(f"  Warning: {PRICE_HIST_FILE} not found - using empty history")
+    try:
+        with open(PRICE_HIST_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return [p for p in data if isinstance(p, dict) and 50 < float(p.get("p", 0)) < 2000]
+    except Exception:
         return []
-    with open(hist_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    # Sanity check
-    data = [p for p in data if 50 < p.get("p", 0) < 2000]
-    return data
 
 
-def build():
-    print(f"Building {DASHBOARD_FILE}...")
+# ═══════════════════════════════════════════════════════════════
+# UI — CSS
+# ═══════════════════════════════════════════════════════════════
 
-    # Load latest price history
-    history = load_price_history()
-    print(f"  Loaded {len(history)} price points")
-    if history:
-        print(f"  Date range: {history[0]['t']} -> {history[-1]['t']}")
+CSS = r"""
+:root{
+  --bg:#0b0f17; --panel:#111827; --panel-2:#172033; --raise:#1c2740; --border:#243049;
+  --text:#e7ecf5; --text-2:#a3afc4; --muted:#6d7a93;
+  --accent:#5b8cff; --accent-soft:rgba(91,140,255,.14); --on-accent:#fff;
+  --up:#34d399; --up-soft:rgba(52,211,153,.13); --down:#f87171; --down-soft:rgba(248,113,113,.13);
+  --warn:#fbbf24; --warn-soft:rgba(251,191,36,.13); --live:#f43f5e;
+  --line:#7aa2ff; --fill:rgba(122,162,255,.10); --grid:rgba(148,163,184,.08);
+  --shadow:0 1px 2px rgba(0,0,0,.3),0 8px 24px rgba(0,0,0,.25);
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  color-scheme:dark;
+}
+:root[data-theme="light"]{
+  --bg:#f4f6fb; --panel:#ffffff; --panel-2:#f7f9fc; --raise:#eef2f8; --border:#e2e8f0;
+  --text:#0f172a; --text-2:#475569; --muted:#64748b;
+  --accent:#2563eb; --accent-soft:rgba(37,99,235,.10); --on-accent:#fff;
+  --up:#15803d; --up-soft:rgba(21,128,61,.10); --down:#dc2626; --down-soft:rgba(220,38,38,.09);
+  --warn:#b45309; --warn-soft:rgba(180,83,9,.10); --live:#e11d48;
+  --line:#2563eb; --fill:rgba(37,99,235,.08); --grid:rgba(15,23,42,.06);
+  --shadow:0 1px 2px rgba(15,23,42,.05),0 6px 18px rgba(15,23,42,.06);
+  color-scheme:light;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 var(--sans);-webkit-font-smoothing:antialiased}
+button,input,select,textarea{font:inherit;color:inherit}
+a{color:var(--accent)}
+.mono{font-family:var(--mono)}
+.muted{color:var(--muted)} .t2{color:var(--text-2)}
+.up{color:var(--up)} .down{color:var(--down)} .warn{color:var(--warn)}
+.hidden{display:none!important}
 
-    body_html = get_body_html().replace("{VERSION}", VERSION)
+/* ── layout ── */
+.app{display:grid;grid-template-columns:220px 1fr;grid-template-rows:auto 1fr;min-height:100vh}
+.topbar{grid-column:1/-1;display:flex;align-items:center;gap:16px;padding:10px 20px;border-bottom:1px solid var(--border);background:var(--panel);position:sticky;top:0;z-index:20}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:.2px;white-space:nowrap}
+.brand .logo{width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,var(--accent),#22c3a6);display:grid;place-items:center;color:#fff;font-size:13px}
+.brand small{font-weight:500;color:var(--muted);font-family:var(--mono);font-size:11px}
+.ticker{display:flex;align-items:baseline;gap:8px;margin-left:8px}
+.ticker .sym{font-weight:700;color:var(--text-2)}
+.ticker .px{font:600 20px var(--mono)}
+.ticker .chg{font:500 12px var(--mono)}
+.spacer{flex:1}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600;border:1px solid var(--border);background:var(--panel-2);white-space:nowrap}
+.pill .dot{width:7px;height:7px;border-radius:50%;background:var(--muted)}
+.pill.ok .dot{background:var(--up);box-shadow:0 0 0 3px var(--up-soft)}
+.pill.bad .dot{background:var(--down)}
+.pill.wait .dot{background:var(--warn)}
+.pill.paper{color:var(--accent);border-color:var(--accent-soft);background:var(--accent-soft)}
+.pill.live{color:#fff;background:var(--live);border-color:var(--live)}
+.side{border-right:1px solid var(--border);background:var(--panel);padding:14px 10px;display:flex;flex-direction:column;gap:2px;position:sticky;top:53px;height:calc(100vh - 53px)}
+.nav{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;color:var(--text-2);text-decoration:none;font-weight:500;cursor:pointer;border:0;background:none;width:100%;text-align:left}
+.nav:hover{background:var(--raise);color:var(--text)}
+.nav.active{background:var(--accent-soft);color:var(--accent)}
+.nav svg{width:17px;height:17px;flex:none}
+.nav .badge{margin-left:auto;font:600 11px var(--mono);padding:1px 7px;border-radius:999px;background:var(--raise);color:var(--text-2)}
+.side .foot{margin-top:auto;padding:10px 12px;font-size:12px;color:var(--muted)}
+main{padding:20px;min-width:0}
+.view{display:none;animation:fade .15s ease}
+.view.active{display:block}
+@keyframes fade{from{opacity:.4}to{opacity:1}}
+h2{font-size:18px;margin:0 0 4px} .sub{color:var(--muted);margin:0 0 16px;font-size:13px}
 
-    html = f"""<!DOCTYPE html>
-<html lang="en">
+/* ── cards ── */
+.card{background:var(--panel);border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow);min-width:0}
+.card-h{display:flex;align-items:center;gap:10px;padding:14px 16px 0}
+.card-h h3{font-size:13px;font-weight:600;margin:0;color:var(--text-2);text-transform:uppercase;letter-spacing:.6px}
+.card-h .right{margin-left:auto;display:flex;gap:8px;align-items:center}
+.card-b{padding:14px 16px 16px}
+.grid{display:grid;gap:16px}
+.kpis{grid-template-columns:repeat(6,minmax(0,1fr))}
+.kpi{padding:14px 16px}
+.kpi .lbl{font-size:12px;color:var(--muted);font-weight:500}
+.kpi .val{font:600 20px var(--mono);margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kpi .sm{font-size:12px;color:var(--text-2);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.main-cols{grid-template-columns:minmax(0,1fr) 360px;margin-top:16px}
+.stack{display:flex;flex-direction:column;gap:16px;min-width:0}
+
+/* ── banners ── */
+.banner{display:flex;gap:12px;align-items:center;padding:12px 16px;border-radius:10px;margin-bottom:16px;border:1px solid var(--border);background:var(--panel-2)}
+.banner.warn{border-color:var(--warn-soft);background:var(--warn-soft)}
+.banner.live{border-color:var(--live);background:var(--down-soft)}
+.banner .grow{flex:1}
+
+/* ── buttons & inputs ── */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:8px 14px;border-radius:8px;border:1px solid var(--border);background:var(--panel-2);font-weight:600;cursor:pointer;white-space:nowrap;transition:background .12s,border-color .12s}
+.btn:hover{background:var(--raise)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+.btn.primary:hover{filter:brightness(1.08)}
+.btn.go{background:var(--up);border-color:var(--up);color:#06281b}
+.btn.stop{background:var(--down-soft);border-color:var(--down);color:var(--down)}
+.btn.sm{padding:5px 10px;font-size:12px}
+.btn.ghost{background:none;border-color:transparent}
+.seg{display:inline-flex;padding:3px;border-radius:9px;background:var(--panel-2);border:1px solid var(--border)}
+.seg button{border:0;background:none;padding:5px 11px;border-radius:7px;font-size:12px;font-weight:600;color:var(--text-2);cursor:pointer}
+.seg button.on{background:var(--raise);color:var(--text);box-shadow:var(--shadow)}
+.field{display:flex;flex-direction:column;gap:6px;margin-bottom:14px}
+.field label{font-size:12px;font-weight:600;color:var(--text-2)}
+.field .hint{font-size:12px;color:var(--muted)}
+.input{width:100%;padding:9px 11px;border-radius:8px;border:1px solid var(--border);background:var(--panel-2);outline:none}
+.input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.input-row{display:flex;gap:8px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.check{display:flex;gap:10px;align-items:flex-start;padding:10px 0;cursor:pointer}
+.check input{margin-top:3px;accent-color:var(--accent)}
+.check b{display:block;font-weight:600}
+.check span{font-size:12px;color:var(--muted)}
+.msg{padding:9px 12px;border-radius:8px;font-size:13px;margin-top:10px}
+.msg.ok{background:var(--up-soft);color:var(--up)}
+.msg.err{background:var(--down-soft);color:var(--down)}
+
+/* ── chart ── */
+.chart-wrap{position:relative;height:340px}
+.chart-empty{position:absolute;inset:0;display:grid;place-items:center;color:var(--muted);font-size:13px;pointer-events:none}
+.chart-foot{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-top:8px}
+.key{display:inline-flex;align-items:center;gap:6px}
+.key i{width:14px;height:0;border-top:2px dashed currentColor;display:inline-block}
+
+/* ── kill-zone timeline ── */
+.kz{position:relative;height:30px;border-radius:8px;background:var(--panel-2);border:1px solid var(--border);overflow:hidden}
+.kz .zone{position:absolute;top:0;bottom:0;background:var(--accent-soft);border-left:1px solid var(--accent);border-right:1px solid var(--accent);display:grid;place-items:center;font:600 11px var(--mono);color:var(--accent)}
+.kz .zone.past{background:var(--raise);border-color:var(--border);color:var(--muted)}
+.kz .zone.now{background:var(--accent);color:var(--on-accent)}
+.kz .nowline{position:absolute;top:0;bottom:0;width:2px;background:var(--warn)}
+.kz-labels{position:relative;height:16px;font:11px var(--mono);color:var(--muted);margin-top:4px}
+.kz-labels span{position:absolute;transform:translateX(-50%);white-space:nowrap}
+.kz-labels span:first-child{transform:none} .kz-labels span:last-child{transform:translateX(-100%)}
+.kz .zone{white-space:nowrap;overflow:hidden}
+
+/* ── trades ── */
+.trade{border:1px solid var(--border);border-radius:10px;padding:12px;background:var(--panel-2)}
+.trade + .trade{margin-top:10px}
+.trade .top{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.dir{font:700 11px var(--mono);padding:3px 8px;border-radius:6px}
+.dir.long{background:var(--up-soft);color:var(--up)} .dir.short{background:var(--down-soft);color:var(--down)}
+.tag{font:600 11px var(--mono);padding:3px 8px;border-radius:6px;background:var(--raise);color:var(--text-2)}
+.trade .pnl{margin-left:auto;font:600 16px var(--mono)}
+.kv{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.kv div{font-size:11px;color:var(--muted)}
+.kv b{display:block;font:600 13px var(--mono);color:var(--text)}
+.prog{position:relative;height:6px;border-radius:3px;background:linear-gradient(90deg,var(--down-soft),var(--raise) 50%,var(--up-soft));margin:12px 0 4px}
+.prog.short{background:linear-gradient(90deg,var(--up-soft),var(--raise) 50%,var(--down-soft))}
+.prog .mk{position:absolute;top:-4px;width:3px;height:14px;border-radius:2px;background:var(--text);transform:translateX(-1px)}
+.prog .en{position:absolute;top:-2px;width:2px;height:10px;background:var(--muted)}
+.prog-l{display:flex;justify-content:space-between;font:11px var(--mono);color:var(--muted)}
+.empty{padding:26px 10px;text-align:center;color:var(--muted);font-size:13px}
+.empty .ico{font-size:22px;margin-bottom:6px;opacity:.7}
+
+/* ── status list ── */
+.dl{display:grid;grid-template-columns:auto 1fr;gap:8px 14px;font-size:13px}
+.dl dt{color:var(--muted)} .dl dd{margin:0;text-align:right;font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* ── log & console ── */
+.log{max-height:360px;overflow:auto;font-size:12.5px}
+.log .e{display:grid;grid-template-columns:62px 54px 1fr;gap:8px;padding:6px 0;border-bottom:1px solid var(--border)}
+.log .e:last-child{border-bottom:0}
+.lvl{font:700 10px var(--mono);padding:2px 0;border-radius:4px;text-align:center;align-self:start;background:var(--raise);color:var(--text-2)}
+.lvl.TRADE{background:var(--accent-soft);color:var(--accent)} .lvl.WARN{background:var(--warn-soft);color:var(--warn)}
+.lvl.ERROR,.lvl.CRITICAL{background:var(--down-soft);color:var(--down)}
+.console{height:calc(100vh - 230px);min-height:320px;overflow:auto;background:#05080e;color:#cfd8e6;border-radius:10px;padding:12px 14px;font:12px/1.55 var(--mono);white-space:pre-wrap;word-break:break-word}
+:root[data-theme="light"] .console{background:#0f172a}
+.console .WARN{color:#fbbf24} .console .ERROR,.console .CRITICAL{color:#f87171} .console .TRADE{color:#7aa2ff}
+.console .PANEL{color:#5eead4}
+
+/* ── signals ── */
+.sig{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;padding:12px 0;border-bottom:1px solid var(--border)}
+.sig:last-child{border-bottom:0}
+.pips{display:flex;gap:3px}
+.pips i{width:7px;height:14px;border-radius:2px;background:var(--raise)}
+.pips i.on{background:var(--accent)}
+
+/* ── code ── */
+pre.code{margin:0;max-height:420px;overflow:auto;background:var(--panel-2);border:1px solid var(--border);border-radius:10px;padding:12px;font:12px/1.5 var(--mono);white-space:pre}
+.steps{counter-reset:s;list-style:none;padding:0;margin:0}
+.steps li{counter-increment:s;position:relative;padding:0 0 16px 38px}
+.steps li:before{content:counter(s);position:absolute;left:0;top:0;width:26px;height:26px;border-radius:50%;background:var(--accent-soft);color:var(--accent);font-weight:700;display:grid;place-items:center;font-size:13px}
+.steps b{display:block;margin-bottom:2px}
+.copy-row{display:flex;gap:8px;align-items:center}
+.copy-row code{flex:1;min-width:0;overflow:auto;white-space:nowrap;padding:8px 10px;border-radius:8px;background:var(--panel-2);border:1px solid var(--border);font:12px var(--mono)}
+
+/* ── modal ── */
+.backdrop{position:fixed;inset:0;background:rgba(3,6,12,.6);backdrop-filter:blur(2px);display:grid;place-items:center;z-index:50;padding:16px}
+.modal{width:min(480px,100%);max-height:calc(100vh - 32px);overflow:auto;background:var(--panel);border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow)}
+.modal-h{display:flex;align-items:center;padding:16px 18px;border-bottom:1px solid var(--border)}
+.modal-h h3{margin:0;font-size:16px}
+.modal-h .x{margin-left:auto}
+.modal-b{padding:18px}
+.modal-f{display:flex;gap:10px;justify-content:flex-end;padding:14px 18px;border-top:1px solid var(--border)}
+.dirpick{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
+.dirpick button{padding:12px;border-radius:10px;border:1px solid var(--border);background:var(--panel-2);font-weight:700;cursor:pointer}
+.dirpick button.long.on{background:var(--up-soft);border-color:var(--up);color:var(--up)}
+.dirpick button.short.on{background:var(--down-soft);border-color:var(--down);color:var(--down)}
+.livepx{display:flex;align-items:baseline;gap:8px;padding:10px 12px;border-radius:10px;background:var(--panel-2);border:1px solid var(--border);margin-bottom:14px}
+.livepx b{font:600 18px var(--mono)}
+.preview{font:12px var(--mono);color:var(--text-2);background:var(--panel-2);border-radius:8px;padding:10px 12px;margin-top:8px}
+
+/* ── toast ── */
+.toast{position:fixed;right:20px;bottom:20px;z-index:60;padding:12px 16px;border-radius:10px;background:var(--panel);border:1px solid var(--border);box-shadow:var(--shadow);max-width:380px;font-size:13px}
+.toast.ok{border-color:var(--up)} .toast.err{border-color:var(--down)}
+
+/* ── responsive ── */
+@media (max-width:1280px){.kpis{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media (max-width:1080px){.main-cols{grid-template-columns:minmax(0,1fr)}}
+@media (max-width:860px){
+  .app{grid-template-columns:1fr}
+  .side{position:static;height:auto;flex-direction:row;overflow-x:auto;padding:6px 10px;border-right:0;border-bottom:1px solid var(--border)}
+  .nav{width:auto;padding:8px 10px;white-space:nowrap} .nav .badge,.side .foot{display:none}
+  .topbar{flex-wrap:wrap;gap:10px;padding:10px 16px} .ticker{margin-left:0}
+  main{padding:16px} .kpis{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .chart-wrap{height:260px} .kv{grid-template-columns:repeat(2,1fr)}
+}
+"""
+
+
+# ═══════════════════════════════════════════════════════════════
+# UI — HTML
+# ═══════════════════════════════════════════════════════════════
+
+ICONS = {
+    "overview": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m7 15 4-4 3 3 5-6"/></svg>',
+    "trades":   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 7h11l-3-3M17 17H6l3 3"/></svg>',
+    "signals":  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2"/><path d="M16.2 7.8a6 6 0 0 1 0 8.4M7.8 16.2a6 6 0 0 1 0-8.4M19.1 4.9a10 10 0 0 1 0 14.2M4.9 19.1a10 10 0 0 1 0-14.2"/></svg>',
+    "console":  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-5-6-5M12 19h8"/></svg>',
+    "settings": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>',
+    "tv":       '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="5" width="20" height="13" rx="2"/><path d="M8 21h8M7 13l3-3 2 2 4-4"/></svg>',
+}
+
+BODY_HTML = r"""
+<div class="app">
+  <header class="topbar">
+    <div class="brand"><div class="logo">NV</div><div>NVDA AutoTrader<br><small>__VERSION__</small></div></div>
+    <div class="ticker"><span class="sym">NVDA</span><span class="px" id="tb-price">—</span><span class="chg" id="tb-chg"></span></div>
+    <div class="spacer"></div>
+    <span class="pill" id="tb-market"><span class="dot"></span><span>Market</span></span>
+    <span class="pill paper" id="tb-mode">PAPER</span>
+    <span class="pill" id="tb-bot"><span class="dot"></span><span id="tb-bot-text">Bot offline</span></span>
+    <button class="btn go panel-only" id="btn-bot" onclick="toggleBot()">▶ Start Bot</button>
+    <button class="btn ghost sm" id="btn-theme" onclick="toggleTheme()" title="Toggle light/dark" aria-label="Toggle theme"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor"/></svg></button>
+  </header>
+
+  <nav class="side" id="side">
+    <button class="nav active" data-view="overview">__I_overview__<span>Overview</span></button>
+    <button class="nav" data-view="trades">__I_trades__<span>Trades</span><span class="badge" id="nav-trades">0</span></button>
+    <button class="nav" data-view="signals">__I_signals__<span>Signals</span><span class="badge" id="nav-signals">0</span></button>
+    <button class="nav panel-only" data-view="console">__I_console__<span>Console</span></button>
+    <button class="nav panel-only" data-view="settings">__I_settings__<span>Settings</span></button>
+    <button class="nav" data-view="tradingview">__I_tv__<span>TradingView</span></button>
+    <div class="foot" id="side-foot">Data refreshes every 5s</div>
+  </nav>
+
+  <main>
+    <div id="banners"></div>
+
+    <!-- ═══ OVERVIEW ═══ -->
+    <section class="view active" id="view-overview">
+      <div class="grid kpis">
+        <div class="card kpi"><div class="lbl">Equity</div><div class="val" id="k-eq">—</div><div class="sm" id="k-eq-s">—</div></div>
+        <div class="card kpi"><div class="lbl">Open P&amp;L</div><div class="val" id="k-pnl">—</div><div class="sm" id="k-pnl-s">No open trade</div></div>
+        <div class="card kpi"><div class="lbl">ATR (5m)</div><div class="val" id="k-atr">—</div><div class="sm" id="k-atr-s">Volatility per bar</div></div>
+        <div class="card kpi"><div class="lbl">VWAP</div><div class="val" id="k-vwap">—</div><div class="sm" id="k-vwap-s">—</div></div>
+        <div class="card kpi"><div class="lbl">Trend · QQQ</div><div class="val" id="k-trend">—</div><div class="sm" id="k-trend-s">—</div></div>
+        <div class="card kpi"><div class="lbl">Multi-timeframe</div><div class="val" id="k-mtf">—</div><div class="sm" id="k-mtf-s">—</div></div>
+      </div>
+
+      <div class="grid main-cols">
+        <div class="stack">
+          <div class="card">
+            <div class="card-h"><h3>Price</h3>
+              <div class="right">
+                <div class="seg" id="range-seg">
+                  <button data-r="1h">1H</button><button data-r="1d" class="on">Today</button><button data-r="5d">5D</button><button data-r="1m">1M</button><button data-r="6m">6M</button>
+                </div>
+              </div>
+            </div>
+            <div class="card-b">
+              <div class="chart-wrap"><canvas id="chart" aria-label="NVDA price chart" role="img"></canvas><div class="chart-empty" id="chart-empty">Loading price history…</div></div>
+              <div class="chart-foot">
+                <span id="chart-range">—</span>
+                <span class="key" style="color:var(--accent)"><i></i>VWAP</span>
+                <span class="key" style="color:var(--text-2)"><i></i>Entry</span>
+                <span class="key" style="color:var(--down)"><i></i>Stop</span>
+                <span class="key" style="color:var(--up)"><i></i>Target</span>
+              </div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-h"><h3>Kill zones (ET)</h3><div class="right t2" id="kz-next" style="font-size:12px"></div></div>
+            <div class="card-b">
+              <div class="kz" id="kz"></div>
+              <div class="kz-labels" id="kz-labels"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="stack">
+          <div class="card">
+            <div class="card-h"><h3 id="ov-trades-title">Active trade</h3><div class="right"><button class="btn primary sm" onclick="openTradeModal()">+ Manual trade</button></div></div>
+            <div class="card-b" id="ov-trades"><div class="empty"><div class="ico">⏳</div>No active trade</div></div>
+          </div>
+          <div class="card">
+            <div class="card-h"><h3>Bot status</h3></div>
+            <div class="card-b">
+              <div id="st-status" style="font-weight:600;margin-bottom:10px">—</div>
+              <dl class="dl">
+                <dt>Strategy</dt><dd id="st-strat">—</dd>
+                <dt>Signals from</dt><dd id="st-src">—</dd>
+                <dt>Last scan</dt><dd id="st-scan">—</dd>
+                <dt>Candles · errors</dt><dd id="st-candles">—</dd>
+                <dt>Setups today</dt><dd id="st-setups">—</dd>
+              </dl>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-h"><h3>Activity</h3></div>
+            <div class="card-b"><div class="log" id="ov-log"><div class="empty">No activity yet</div></div></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ TRADES ═══ -->
+    <section class="view" id="view-trades">
+      <div class="row" style="margin-bottom:16px"><div><h2>Trades</h2><p class="sub" style="margin:0">Open positions the bot is tracking, and the most recent close.</p></div><div class="spacer"></div><button class="btn primary" onclick="openTradeModal()">+ Manual trade</button></div>
+      <div class="grid" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr)" id="trades-grid">
+        <div class="card"><div class="card-h"><h3>Open</h3></div><div class="card-b" id="tr-open"><div class="empty">No open trades</div></div></div>
+        <div class="card"><div class="card-h"><h3>Last closed</h3></div><div class="card-b" id="tr-closed"><div class="empty">Nothing closed yet today</div></div></div>
+      </div>
+      <p class="sub" style="margin-top:14px">Full history is in <span class="mono">trade_logs/master_trade_log.csv</span>.</p>
+    </section>
+
+    <!-- ═══ SIGNALS ═══ -->
+    <section class="view" id="view-signals">
+      <h2>Signals today</h2><p class="sub">Every FVG / VWAP setup the bot scored today, newest first. Score is out of 9.</p>
+      <div class="card"><div class="card-b" id="sig-list"><div class="empty">No setups detected yet today</div></div></div>
+    </section>
+
+    <!-- ═══ CONSOLE ═══ -->
+    <section class="view" id="view-console">
+      <div class="row" style="margin-bottom:12px">
+        <div><h2>Console</h2><p class="sub" style="margin:0">Everything the bot prints. Also saved to <span class="mono">bot_console.log</span>.</p></div>
+        <div class="spacer"></div>
+        <div class="seg" id="con-filter"><button data-f="all" class="on">All</button><button data-f="TRADE">Trades</button><button data-f="WARN">Warnings</button><button data-f="ERROR">Errors</button></div>
+        <label class="row t2" style="font-size:12px;gap:6px"><input type="checkbox" id="con-follow" checked> Follow</label>
+      </div>
+      <div class="console" id="console"><span class="muted">Waiting for the bot to start…</span></div>
+    </section>
+
+    <!-- ═══ SETTINGS ═══ -->
+    <section class="view" id="view-settings">
+      <h2>Settings</h2><p class="sub">Saved to <span class="mono" id="set-file">nvda_settings.json</span> on this computer. Changes apply the next time the bot starts.</p>
+      <div class="grid" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr)" id="settings-grid">
+        <div class="card">
+          <div class="card-h"><h3>Alpaca account</h3><div class="right"><span class="pill" id="set-keystate">No keys</span></div></div>
+          <div class="card-b">
+            <div class="field">
+              <label>Account type</label>
+              <div class="seg" id="set-mode"><button data-m="paper" class="on">Paper trading</button><button data-m="live">Live money</button></div>
+              <span class="hint">Paper and live accounts have different keys. Get them at app.alpaca.markets → API Keys.</span>
+            </div>
+            <div class="field">
+              <label for="set-key">API key ID</label>
+              <input class="input mono" id="set-key" autocomplete="off" spellcheck="false" placeholder="PK…">
+              <span class="hint" id="set-key-hint">Leave blank to keep the saved key.</span>
+            </div>
+            <div class="field">
+              <label for="set-secret">Secret key</label>
+              <div class="input-row">
+                <input class="input mono" id="set-secret" type="password" autocomplete="new-password" spellcheck="false" placeholder="••••••••">
+                <button class="btn" type="button" onclick="toggleSecret()" id="btn-show">Show</button>
+              </div>
+              <span class="hint">Never shown again after saving. Leave blank to keep the saved secret.</span>
+            </div>
+            <div class="row">
+              <button class="btn" onclick="testKeys()" id="btn-test">Test connection</button>
+              <button class="btn primary" onclick="saveKeys()">Save keys</button>
+              <div class="spacer"></div>
+              <button class="btn ghost sm down" onclick="clearKeys()">Remove saved keys</button>
+            </div>
+            <div id="set-msg"></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-h"><h3>Bot behaviour</h3></div>
+          <div class="card-b">
+            <div class="field">
+              <label>Where trades come from</label>
+              <div class="seg" id="set-src"><button data-s="bot" class="on">Bot strategies</button><button data-s="tradingview">TradingView alerts</button><button data-s="both">Both</button></div>
+              <span class="hint" id="set-src-hint"></span>
+            </div>
+            <label class="check"><input type="checkbox" id="set-restart"><div><b>Auto-restart if the bot crashes</b><span>Replaces Task Scheduler's retry. Pauses after 5 crashes in 10 minutes.</span></div></label>
+            <div class="row" style="margin-top:6px"><button class="btn primary" onclick="saveBehaviour()">Save</button></div>
+            <div id="set-msg2"></div>
+            <hr style="border:0;border-top:1px solid var(--border);margin:18px 0">
+            <p class="t2" style="font-size:13px;margin:0 0 6px"><b>Run automatically every morning</b></p>
+            <p class="muted" style="font-size:12px;margin:0">Point Windows Task Scheduler (8:20 AM) at:</p>
+            <div class="copy-row" style="margin-top:8px"><code id="cmd-auto">python build_dashboard.py --autostart --no-browser</code><button class="btn sm" onclick="copyText('cmd-auto')">Copy</button></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ TRADINGVIEW ═══ -->
+    <section class="view" id="view-tradingview">
+      <h2>TradingView</h2>
+      <p class="sub">Two ways to use the bot there: <b>forward-test</b> the Pine Script port on TradingView's own simulator (free), and/or let TradingView <b>alerts place Alpaca paper orders</b> through this bot (needs a paid TradingView plan for webhooks).</p>
+      <div class="grid" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr)" id="tv-grid">
+        <div class="card">
+          <div class="card-h"><h3>1 · Pine Script strategy</h3><div class="right"><button class="btn sm" onclick="copyPine()">Copy script</button><button class="btn sm" onclick="downloadPine()">Download</button></div></div>
+          <div class="card-b">
+            <ol class="steps">
+              <li><b>Open an NVDA chart on the 5-minute timeframe</b><span class="muted">The strategies were built for 5m bars, same as the bot.</span></li>
+              <li><b>Pine Editor → paste → Save → Add to chart</b><span class="muted">Results appear in the Strategy Tester tab. TradingView simulates fills on live bars — that's its paper trading.</span></li>
+              <li><b>Settings (gear) → Inputs</b><span class="muted">Toggle strategies, kill zones and risk. Paste your webhook passphrase if you'll use step 2.</span></li>
+            </ol>
+            <pre class="code" id="pine-code">Loading…</pre>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-h"><h3>2 · Alerts → Alpaca orders</h3><div class="right"><span class="pill" id="tv-state">Off</span></div></div>
+          <div class="card-b">
+            <label class="check"><input type="checkbox" id="tv-enabled"><div><b>Accept TradingView alerts</b><span>The bot opens a webhook receiver on this computer. Orders go through the same checks as manual trades.</span></div></label>
+            <div class="field">
+              <label for="tv-pass">Passphrase</label>
+              <div class="input-row"><input class="input mono" id="tv-pass" spellcheck="false" placeholder="Click Generate"><button class="btn" onclick="genPass()">Generate</button><button class="btn" onclick="copyVal('tv-pass')">Copy</button></div>
+              <span class="hint">Paste this into the Pine script's "Webhook passphrase" input. Anyone with your webhook URL + passphrase can trade, so keep it secret.</span>
+            </div>
+            <div class="row" style="gap:12px">
+              <div class="field" style="flex:0 0 120px"><label for="tv-port">Local port</label><input class="input mono" id="tv-port" type="number" min="1024" max="65535"></div>
+              <div class="field" style="flex:1"><label for="tv-url">Public tunnel URL (optional, for reference)</label><input class="input mono" id="tv-url" spellcheck="false" placeholder="https://xxxx.ngrok-free.app"></div>
+            </div>
+            <div class="row"><button class="btn primary" onclick="saveTV()">Save</button></div>
+            <div id="tv-msg"></div>
+            <hr style="border:0;border-top:1px solid var(--border);margin:18px 0">
+            <ol class="steps">
+              <li><b>Expose the receiver with a tunnel</b><span class="muted">TradingView can only call a public HTTPS address. Run one of:</span>
+                <div class="copy-row" style="margin-top:6px"><code id="cmd-ngrok">ngrok http 8090</code><button class="btn sm" onclick="copyText('cmd-ngrok')">Copy</button></div>
+                <div class="copy-row" style="margin-top:6px"><code id="cmd-cf">cloudflared tunnel --url http://127.0.0.1:8090</code><button class="btn sm" onclick="copyText('cmd-cf')">Copy</button></div></li>
+              <li><b>Webhook URL for the alert</b>
+                <div class="copy-row" style="margin-top:6px"><code id="tv-hook">https://YOUR-TUNNEL/tv_webhook</code><button class="btn sm" onclick="copyText('tv-hook')">Copy</button></div></li>
+              <li><b>Create the alert</b><span class="muted">Alert → Condition: the strategy → "Order fills only". Notifications → Webhook URL (above). Message:</span>
+                <div class="copy-row" style="margin-top:6px"><code id="tv-msgtpl">{{strategy.order.alert_message}}</code><button class="btn sm" onclick="copyText('tv-msgtpl')">Copy</button></div></li>
+              <li><b>Settings → "Where trades come from" → TradingView alerts</b><span class="muted">Then restart the bot. "Both" also keeps the bot's own strategies on.</span></li>
+            </ol>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- ═══ MANUAL TRADE MODAL ═══ -->
+<div class="backdrop hidden" id="m-trade" onclick="if(event.target===this)closeTradeModal()">
+  <div class="modal" role="dialog" aria-labelledby="m-trade-h">
+    <div class="modal-h"><h3 id="m-trade-h">Manual trade</h3><button class="btn ghost sm x" onclick="closeTradeModal()" aria-label="Close">✕</button></div>
+    <div class="modal-b">
+      <div class="dirpick"><button class="long" id="m-long" onclick="setDir('bullish')">▲ LONG</button><button class="short" id="m-short" onclick="setDir('bearish')">▼ SHORT</button></div>
+      <div class="livepx"><span class="muted">Live</span><b id="m-px">—</b><span class="muted" id="m-px-note" style="font-size:12px;margin-left:auto">fetching…</span></div>
+      <div class="field"><label for="m-qty">Shares</label><input class="input mono" id="m-qty" type="number" min="1" value="10" oninput="updatePreview()"></div>
+      <label class="check" style="padding-top:0"><input type="checkbox" id="m-atr" checked onchange="toggleAtr()"><div><b>Stop &amp; target from ATR</b><span id="m-atr-note">Stop = multiplier × ATR, target = 1.5 × stop distance</span></div></label>
+      <div id="m-atr-row" class="field">
+        <div class="seg" id="m-mult"><button data-x="0.5">0.5×</button><button data-x="1" class="on">1×</button><button data-x="1.5">1.5×</button><button data-x="2">2×</button><button data-x="2.5">2.5×</button></div>
+      </div>
+      <div id="m-manual" class="hidden">
+        <div class="row" style="gap:12px">
+          <div class="field" style="flex:1"><label for="m-stop">Stop</label><input class="input mono" id="m-stop" type="number" step="0.01" oninput="updatePreview()"></div>
+          <div class="field" style="flex:1"><label for="m-target">Target</label><input class="input mono" id="m-target" type="number" step="0.01" oninput="updatePreview()"></div>
+        </div>
+      </div>
+      <div class="preview" id="m-preview">Pick a direction.</div>
+      <div class="field" style="margin-top:14px">
+        <label>Management</label>
+        <div class="seg" id="m-managed"><button data-v="1" class="on">Bot manages exits</button><button data-v="0">Log only</button></div>
+      </div>
+      <label class="check" id="m-trail-row"><input type="checkbox" id="m-trail"><div><b>Trailing stop</b><span>Breakeven at 1R, then trails at 2R</span></div></label>
+      <div id="m-msg"></div>
+    </div>
+    <div class="modal-f"><button class="btn" onclick="closeTradeModal()">Cancel</button><button class="btn primary" id="m-submit" onclick="submitTrade()">Place order</button></div>
+  </div>
+</div>
+
+<!-- ═══ CLOSE TRADE MODAL ═══ -->
+<div class="backdrop hidden" id="m-close" onclick="if(event.target===this)closeCloseModal()">
+  <div class="modal" role="dialog" aria-labelledby="m-close-h">
+    <div class="modal-h"><h3 id="m-close-h">Close trade</h3><button class="btn ghost sm x" onclick="closeCloseModal()" aria-label="Close">✕</button></div>
+    <div class="modal-b">
+      <p class="t2" style="margin-top:0">The bot cancels this trade's open orders and market-closes the position on Alpaca, then waits for confirmation.</p>
+      <div class="field"><label for="c-pnl">Realized P&amp;L (optional)</label><input class="input mono" id="c-pnl" type="number" step="0.01" placeholder="Leave blank to estimate from last price"></div>
+      <div id="c-msg"></div>
+    </div>
+    <div class="modal-f"><button class="btn" onclick="closeCloseModal()">Cancel</button><button class="btn stop" id="c-submit" onclick="submitClose()">Close position</button></div>
+  </div>
+</div>
+
+<!-- ═══ GO LIVE MODAL ═══ -->
+<div class="backdrop hidden" id="m-live">
+  <div class="modal" role="dialog" aria-labelledby="m-live-h">
+    <div class="modal-h"><h3 id="m-live-h">Switch to live money?</h3></div>
+    <div class="modal-b">
+      <p style="margin-top:0">The bot will place <b>real orders with real money</b> on your Alpaca live account. Shorts have no stop on Alpaca's side — if the bot stops running, a short is unprotected.</p>
+      <p class="t2">Also turn on PDT protection in <span class="mono">CONFIG</span> if the account is under $25k, and use your <b>live</b> API keys (paper keys won't work).</p>
+      <div class="field"><label for="live-confirm">Type LIVE to confirm</label><input class="input mono" id="live-confirm" autocomplete="off"></div>
+    </div>
+    <div class="modal-f"><button class="btn" onclick="cancelLive()">Stay on paper</button><button class="btn stop" onclick="confirmLive()">Switch to live</button></div>
+  </div>
+</div>
+
+<div class="toast hidden" id="toast"></div>
+"""
+
+
+# ═══════════════════════════════════════════════════════════════
+# UI — JS
+# ═══════════════════════════════════════════════════════════════
+
+JS = r"""
+const APP = { standalone: __STANDALONE__, version: "__VERSION__" };
+const $ = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
+const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const money = (v, d=2) => (v == null || isNaN(v)) ? '—' : '$' + Number(v).toLocaleString('en-US', {minimumFractionDigits:d, maximumFractionDigits:d});
+const signed = v => (v >= 0 ? '+' : '−') + money(Math.abs(v));
+const cap = s => (s || '—').toString().replace(/_/g, ' ').toUpperCase();
+const cssv = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+let D = null, botStatus = null, settings = null;
+
+async function api(path, body, opts = {}) {
+  const init = { signal: AbortSignal.timeout(opts.timeout || 10000) };
+  if (body !== undefined) {
+    init.method = 'POST';
+    init.headers = { 'Content-Type': 'application/json' };
+    init.body = JSON.stringify(body);
+  }
+  try {
+    const r = await fetch(path, init);
+    const ct = r.headers.get('Content-Type') || '';
+    const data = ct.includes('json') ? await r.json() : await r.text();
+    if (data && typeof data === 'object' && !Array.isArray(data) && !r.ok && data.ok === undefined) data.ok = false;
+    return { status: r.status, data };
+  } catch (e) {
+    return { status: 0, data: { ok: false, error: e.name === 'TimeoutError' ? 'Timed out' : 'Not reachable' } };
+  }
+}
+
+function toast(msg, kind = 'ok') {
+  const t = $('#toast');
+  t.className = 'toast ' + kind; t.textContent = msg;
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.add('hidden'), 4500);
+}
+function showMsg(el, msg, ok) { $(el).innerHTML = msg ? `<div class="msg ${ok ? 'ok' : 'err'}">${esc(msg)}</div>` : ''; }
+
+/* ── theme ───────────────────────────────────────────────── */
+function setTheme(t) {
+  document.documentElement.dataset.theme = t;
+  try { localStorage.setItem('nvda-theme', t); } catch (e) {}
+  if (chart) { chart.destroy(); chart = null; initChart(); renderChart(); }
+}
+function toggleTheme() { setTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light'); }
+(function () { let t = 'dark'; try { t = localStorage.getItem('nvda-theme') || 'dark'; } catch (e) {} document.documentElement.dataset.theme = t; })();
+
+/* ── navigation ──────────────────────────────────────────── */
+function showView(v) {
+  if (!$('#view-' + v)) v = 'overview';
+  $$('.view').forEach(e => e.classList.toggle('active', e.id === 'view-' + v));
+  $$('.nav').forEach(e => e.classList.toggle('active', e.dataset.view === v));
+  if (location.hash !== '#' + v) history.replaceState(null, '', '#' + v);
+  if (v === 'tradingview') loadPine();
+  if (v === 'console') { pollConsole(); scrollConsole(); }
+  if (v === 'overview' && chart) chart.resize();
+}
+$$('.nav').forEach(b => b.addEventListener('click', () => showView(b.dataset.view)));
+
+/* ── chart ───────────────────────────────────────────────── */
+let chart = null, range = '1d', hist = [], sixMonth = null;
+
+const refLines = {
+  id: 'refLines',
+  afterDatasetsDraw(c) {
+    const lines = c.options.plugins.refLines.lines || [];
+    const { ctx, chartArea: a, scales: { y } } = c;
+    ctx.save();
+    ctx.font = '600 11px ' + cssv('--mono');
+    lines.forEach(l => {
+      const py = y.getPixelForValue(l.v);
+      if (py < a.top || py > a.bottom) return;
+      ctx.strokeStyle = l.color; ctx.lineWidth = 1.25; ctx.setLineDash(l.dash || [5, 4]);
+      ctx.beginPath(); ctx.moveTo(a.left, py); ctx.lineTo(a.right, py); ctx.stroke(); ctx.setLineDash([]);
+      const txt = l.label + ' ' + l.v.toFixed(2), w = ctx.measureText(txt).width + 10;
+      ctx.fillStyle = l.color; ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(a.right - w, py - 9, w, 18, 4); else ctx.rect(a.right - w, py - 9, w, 18);
+      ctx.fill(); ctx.fillStyle = l.ink; ctx.fillText(txt, a.right - w + 5, py + 4);
+    });
+    const act = c.tooltip && c.tooltip.getActiveElements && c.tooltip.getActiveElements();
+    if (act && act.length) {
+      const x = act[0].element.x;
+      ctx.strokeStyle = cssv('--muted'); ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(x, a.top); ctx.lineTo(x, a.bottom); ctx.stroke();
+    }
+    ctx.restore();
+  }
+};
+
+function initChart() {
+  if (typeof Chart === 'undefined') { $('#chart-empty').textContent = 'Chart library failed to load (no internet?)'; return; }
+  const ctx = $('#chart').getContext('2d');
+  chart = new Chart(ctx, {
+    type: 'line',
+    data: { labels: [], datasets: [{ data: [], borderColor: cssv('--line'), backgroundColor: cssv('--fill'), borderWidth: 2,
+      pointRadius: 0, pointHoverRadius: 5, pointHoverBorderWidth: 2, pointHoverBorderColor: cssv('--panel'), pointHoverBackgroundColor: cssv('--line'),
+      fill: true, tension: 0.25, spanGaps: true }] },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      interaction: { mode: 'index', intersect: false },
+      layout: { padding: { right: 4 } },
+      plugins: {
+        legend: { display: false }, refLines: { lines: [] },
+        tooltip: { backgroundColor: cssv('--panel'), titleColor: cssv('--text-2'), bodyColor: cssv('--text'), borderColor: cssv('--border'),
+          borderWidth: 1, padding: 10, displayColors: false, titleFont: { family: cssv('--mono'), size: 11 }, bodyFont: { family: cssv('--mono'), size: 13, weight: '600' },
+          callbacks: { title: it => it.length ? fullLabel(it[0].dataIndex) : '', label: c => money(c.parsed.y) } }
+      },
+      scales: {
+        x: { grid: { display: false }, border: { color: cssv('--border') },
+          ticks: { color: cssv('--muted'), font: { family: cssv('--mono'), size: 10 }, maxRotation: 0, autoSkip: true, maxTicksLimit: 7 } },
+        y: { position: 'left', grid: { color: cssv('--grid') }, border: { display: false },
+          ticks: { color: cssv('--muted'), font: { family: cssv('--mono'), size: 10 }, callback: v => '$' + Number(v).toFixed(0), maxTicksLimit: 6 } }
+      }
+    },
+    plugins: [refLines]
+  });
+}
+
+const etToday = () => new Date().toLocaleString('sv-SE', { timeZone: 'America/New_York' }).slice(0, 10);
+const minsOf = t => { const [d, tm] = t.split('T'); const [y, mo, da] = d.split('-').map(Number); const [h, mi] = (tm || '0:0').split(':').map(Number); return Date.UTC(y, mo - 1, da, h, mi) / 60000; };
+const MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+let shown = [];
+
+function thin(pts, max) {
+  if (pts.length <= max) return pts;
+  const step = pts.length / max, out = [];
+  for (let i = 0; i < max; i++) out.push(pts[Math.floor(i * step)]);
+  out[out.length - 1] = pts[pts.length - 1];
+  return out;
+}
+function lastDates(pts, n) {
+  const dates = [...new Set(pts.map(p => p.t.slice(0, 10)))].sort().slice(-n);
+  const set = new Set(dates);
+  return pts.filter(p => set.has(p.t.slice(0, 10)));
+}
+function pointsFor(r) {
+  if (r === '6m') {
+    if (sixMonth === null) { loadSixMonth(); return null; }
+    return sixMonth.map(p => ({ t: p.t, p: p.p }));
+  }
+  const pts = hist.filter(p => p && p.t && p.p > 0).sort((a, b) => a.t < b.t ? -1 : a.t > b.t ? 1 : 0);
+  if (!pts.length) return [];
+  if (r === '1h' || r === '1d') {
+    let day = pts.filter(p => p.t.slice(0, 10) === etToday());
+    if (!day.length) day = lastDates(pts, 1);
+    if (r === '1h') { const end = minsOf(day[day.length - 1].t); day = day.filter(p => minsOf(p.t) >= end - 60); }
+    return day;
+  }
+  if (r === '5d') return thin(lastDates(pts, 5), 500);
+  if (r === '1m') return thin(lastDates(pts, 22), 500);
+  return pts;
+}
+function tickLabel(t, r) {
+  const d = t.slice(0, 10), tm = t.slice(11, 16);
+  if (r === '1h' || r === '1d') return tm;
+  if (r === '6m') return MON[+d.slice(5, 7) - 1] + ' ' + (+d.slice(8, 10));
+  return d.slice(5, 7) + '/' + d.slice(8, 10);
+}
+function fullLabel(i) {
+  const p = shown[i]; if (!p) return '';
+  return p.t.length > 10 ? p.t.slice(0, 10) + ' ' + p.t.slice(11, 16) + ' ET' : p.t;
+}
+
+function renderChart() {
+  if (!chart) return;
+  const pts = pointsFor(range);
+  const empty = $('#chart-empty');
+  if (pts === null) { empty.textContent = 'Loading 6 months of daily bars…'; empty.classList.remove('hidden'); return; }
+  if (!pts.length) {
+    empty.textContent = range === '6m' ? 'Daily bars unavailable — the bot must be running' : 'No price data for this range yet';
+    empty.classList.remove('hidden');
+    chart.data.labels = []; chart.data.datasets[0].data = []; chart.update('none'); $('#chart-range').textContent = '—';
+    return;
+  }
+  empty.classList.add('hidden');
+  shown = pts;
+  let prevDay = null;
+  chart.data.labels = pts.map(p => {
+    if (range === '5d' || range === '1m') { const d = p.t.slice(0, 10); const lbl = d !== prevDay ? tickLabel(p.t, range) : ''; prevDay = d; return lbl; }
+    return tickLabel(p.t, range);
+  });
+  chart.options.scales.x.ticks.autoSkip = !(range === '5d' || range === '1m');
+  chart.data.datasets[0].data = pts.map(p => p.p);
+
+  const vals = pts.map(p => p.p), lo = Math.min(...vals), hi = Math.max(...vals);
+  const lines = [];
+  const intraday = range === '1h' || range === '1d';
+  const ink = cssv('--on-accent');
+  if (D && intraday && D.last_vwap > 0) lines.push({ v: D.last_vwap, label: 'VWAP', color: cssv('--accent'), ink, dash: [2, 3] });
+  const tr = D && (D.active_trades || [])[0];
+  if (tr && intraday) {
+    lines.push({ v: tr.entry, label: 'Entry', color: cssv('--text-2'), ink: cssv('--panel') });
+    lines.push({ v: tr.stop, label: 'Stop', color: cssv('--down'), ink });
+    lines.push({ v: tr.target, label: 'Target', color: cssv('--up'), ink });
+  }
+  const keep = lines.filter(l => l.v > 0 && l.v > lo * 0.97 && l.v < hi * 1.03);
+  chart.options.plugins.refLines.lines = keep;
+  const all = vals.concat(keep.map(l => l.v));
+  const pad = (Math.max(...all) - Math.min(...all)) * 0.06 || 1;
+  chart.options.scales.y.suggestedMin = Math.min(...all) - pad;
+  chart.options.scales.y.suggestedMax = Math.max(...all) + pad;
+  chart.update('none');
+  const first = pts[0].p, last = pts[pts.length - 1].p, ch = last - first;
+  $('#chart-range').innerHTML = `${pts.length} pts · low ${money(lo)} · high ${money(hi)} · <span class="${ch >= 0 ? 'up' : 'down'}">${ch >= 0 ? '+' : '−'}${money(Math.abs(ch))} (${(ch / first * 100).toFixed(2)}%)</span>`;
+}
+async function loadSixMonth() {
+  if (loadSixMonth.busy) return; loadSixMonth.busy = true;
+  const r = await api('/daily_history', undefined, { timeout: 25000 });
+  sixMonth = Array.isArray(r.data) ? r.data : [];
+  loadSixMonth.busy = false;
+  if (!sixMonth.length) setTimeout(() => { sixMonth = null; }, 30000);
+  renderChart();
+}
+$$('#range-seg button').forEach(b => b.addEventListener('click', () => {
+  $$('#range-seg button').forEach(x => x.classList.toggle('on', x === b)); range = b.dataset.r; renderChart();
+}));
+
+/* ── kill zones ──────────────────────────────────────────── */
+const KZ = [['09:30', '11:00'], ['12:00', '13:00'], ['14:00', '15:55']];
+const hm = s => { const [h, m] = s.split(':').map(Number); return h * 60 + m; };
+function renderKZ() {
+  const open = hm('09:30'), close = hm('16:00'), span = close - open;
+  const et = new Date().toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour12: false });
+  const [h, m] = et.split(':').map(Number), now = h * 60 + m;
+  let html = '';
+  KZ.forEach(([s, e]) => {
+    const a = hm(s), b = hm(e);
+    const cls = now >= a && now < b ? 'now' : now >= b ? 'past' : '';
+    html += `<div class="zone ${cls}" style="left:${(a - open) / span * 100}%;width:${(b - a) / span * 100}%" title="${s}–${e} ET">${window.innerWidth < 600 ? '' : s + '–' + e}</div>`;
+  });
+  if (now >= open && now <= close) html += `<div class="nowline" style="left:${(now - open) / span * 100}%"></div>`;
+  $('#kz').innerHTML = html;
+  if (!$('#kz-labels').childElementCount)
+    $('#kz-labels').innerHTML = ['09:30', '11:00', '12:00', '13:00', '14:00', '16:00']
+      .map(t => `<span style="left:${(hm(t) - open) / span * 100}%">${t}</span>`).join('');
+  let note = '';
+  if (D) note = D.in_kill_zone ? 'In kill zone — scanning' : D.next_kz ? `Next: ${D.next_kz} ET (${D.mins_to_kz ?? '?'} min)` : 'All kill zones done';
+  $('#kz-next').textContent = note;
+}
+
+/* ── data poll ───────────────────────────────────────────── */
+async function pollData() {
+  const r = await api('/data', undefined, { timeout: 6000 });
+  if (r.status === 200 && r.data && r.data.status !== undefined) {
+    D = r.data;
+    if (Array.isArray(D.price_history) && D.price_history.length) hist = D.price_history;
+    renderData();
+  } else {
+    D = null;
+    renderOffline(r.data && r.data.error);
+  }
+  renderChart(); renderKZ(); renderBot(); renderBanners();
+}
+async function loadHistoryOnce() {
+  const r = await api('/history', undefined, { timeout: 8000 });
+  if (Array.isArray(r.data) && r.data.length && !hist.length) { hist = r.data; renderChart(); }
+}
+
+function setText(id, v, cls) { const e = $(id); e.textContent = v; if (cls !== undefined) e.className = e.className.replace(/\b(up|down|warn|t2)\b/g, '').trim() + (cls ? ' ' + cls : ''); }
+function dirCls(v) { v = (v || '').toLowerCase(); return v.includes('bull') ? 'up' : v.includes('bear') ? 'down' : 'warn'; }
+
+function renderData() {
+  const d = D;
+  const px = d.last_price || 0;
+  $('#tb-price').textContent = px ? money(px) : '—';
+  const today = (hist || []).filter(p => p.t && p.t.slice(0, 10) === etToday());
+  if (px && today.length) {
+    const ch = px - today[0].p;
+    $('#tb-chg').textContent = `${ch >= 0 ? '+' : '−'}${Math.abs(ch).toFixed(2)} (${(ch / today[0].p * 100).toFixed(2)}%)`;
+    $('#tb-chg').className = 'chg ' + (ch >= 0 ? 'up' : 'down');
+  }
+  const mk = $('#tb-market');
+  mk.className = 'pill ' + (d.market_open ? (d.in_kill_zone ? 'ok' : 'wait') : 'bad');
+  mk.lastElementChild.textContent = d.market_open ? (d.in_kill_zone ? `Kill zone ${d.current_kz || ''}` : 'Market open') : 'Market closed';
+
+  const eq = d.equity || 0, bod = d.bod_equity || 0;
+  const dayPnl = eq > 0 && bod > 0 ? eq - bod : (d.daily_pnl || 0);
+  setText('#k-eq', eq ? money(eq, 0) : '—');
+  setText('#k-eq-s', eq && bod ? 'Today ' + signed(dayPnl) : '—', eq && bod ? (dayPnl >= 0 ? 'up' : 'down') : '');
+
+  const open = d.active_trades || [];
+  const unreal = open.reduce((s, t) => s + (parseFloat(t.pnl) || 0), 0);
+  if (open.length) { setText('#k-pnl', signed(unreal), unreal >= 0 ? 'up' : 'down'); setText('#k-pnl-s', `${open.length} open position${open.length > 1 ? 's' : ''}`); }
+  else { setText('#k-pnl', '—', ''); setText('#k-pnl-s', d.closed_trade ? `Last: ${d.closed_trade.outcome} ${signed(parseFloat(d.closed_trade.pnl) || 0)}` : 'No open trade'); }
+
+  setText('#k-atr', d.last_atr ? '$' + Number(d.last_atr).toFixed(3) : '—');
+  setText('#k-atr-s', d.last_atr && px ? `${(d.last_atr / px * 100).toFixed(2)}% of price` : 'Volatility per bar');
+  setText('#k-vwap', d.last_vwap ? money(d.last_vwap) : '—');
+  if (d.last_vwap && px) { const dv = px - d.last_vwap; setText('#k-vwap-s', `Price ${dv >= 0 ? 'above' : 'below'} by ${money(Math.abs(dv))}`, dv >= 0 ? 'up' : 'down'); }
+  setText('#k-trend', cap(d.last_trend), dirCls(d.last_trend));
+  setText('#k-trend-s', 'QQQ ' + cap(d.last_qqq), dirCls(d.last_qqq));
+  setText('#k-mtf', cap(d.mtf_bias), dirCls(d.mtf_bias));
+  setText('#k-mtf-s', `Week ${cap(d.weekly_trend)} · Month ${cap(d.monthly_trend)}`);
+
+  $('#st-status').textContent = d.status || '—';
+  setText('#st-strat', d.active_strategy || '—');
+  setText('#st-src', settings ? ({ bot: 'Bot strategies', tradingview: 'TradingView', both: 'Bot + TradingView' })[settings.signal_source] : (botStatus ? botStatus.signal_source : '—'));
+  setText('#st-scan', d.last_scan_time || '—');
+  setText('#st-candles', `${d.last_candles || 0} · ${d.fetch_errors || 0}`);
+  setText('#st-setups', `${d.fvgs_today || 0} (best ${d.best_score || 0}/9)`);
+
+  // trades
+  $('#nav-trades').textContent = open.length;
+  $('#ov-trades-title').textContent = open.length > 1 ? `Active trades (${open.length})` : open.length ? 'Active trade' : d.closed_trade ? 'Last trade' : 'Active trade';
+  const cards = open.map(tradeCard).join('');
+  $('#ov-trades').innerHTML = cards || (d.closed_trade ? tradeCard(d.closed_trade) : `<div class="empty"><div class="ico">⏳</div>No active trade</div>`);
+  $('#tr-open').innerHTML = cards || '<div class="empty">No open trades</div>';
+  $('#tr-closed').innerHTML = d.closed_trade ? tradeCard(d.closed_trade) : '<div class="empty">Nothing closed yet today</div>';
+
+  // signals
+  const sigs = (d.all_fvgs || []).slice().reverse();
+  $('#nav-signals').textContent = sigs.length;
+  $('#sig-list').innerHTML = sigs.length ? sigs.map(f => `
+    <div class="sig">
+      <span class="dir ${f.type === 'bullish' ? 'long' : 'short'}">${f.type === 'bullish' ? '▲ LONG' : '▼ SHORT'}</span>
+      <div><b class="mono">${esc(f.time)}</b> <span class="t2">· size $${esc(f.size)} · entry ${money(f.entry_zone)}</span><div class="muted" style="font-size:12px;margin-top:2px">${esc(f.notes)}</div></div>
+      <div style="text-align:right"><div class="pips">${Array.from({ length: 9 }, (_, i) => `<i class="${i < f.score ? 'on' : ''}"></i>`).join('')}</div><div class="mono muted" style="font-size:11px;margin-top:3px">${esc(f.score)}/9</div></div>
+    </div>`).join('') : '<div class="empty">No setups detected yet today</div>';
+
+  // activity log
+  const log = d.log || [];
+  $('#ov-log').innerHTML = log.length ? log.map(e => `
+    <div class="e"><span class="mono muted">${esc((e.time || '').split(' ')[0])}</span><span class="lvl ${esc(e.level)}">${esc(e.level)}</span><span>${esc(e.message)}</span></div>`).join('') : '<div class="empty">No activity yet</div>';
+}
+
+function tradeCard(t) {
+  const long = t.fvg_type === 'bullish';
+  const pnl = parseFloat(t.pnl) || 0;
+  const isOpen = !t.outcome || t.outcome === 'OPEN';
+  const manual = t.strategy === 'MANUAL';
+  const px = D ? D.last_price : 0;
+  let prog = '';
+  if (isOpen && t.stop && t.target && px) {
+    const lo = Math.min(t.stop, t.target), hi = Math.max(t.stop, t.target), span = hi - lo || 1;
+    const pos = v => Math.max(0, Math.min(100, (v - lo) / span * 100));
+    const left = long ? 'Stop' : 'Target', right = long ? 'Target' : 'Stop';
+    prog = `<div class="prog ${long ? '' : 'short'}"><span class="en" style="left:${pos(t.entry)}%"></span><span class="mk" style="left:${pos(px)}%"></span></div>
+      <div class="prog-l"><span>${left} ${money(lo)}</span><span>now ${money(px)}</span><span>${right} ${money(hi)}</span></div>`;
+  }
+  const stopLbl = t.stop && t.entry && t.stop.toFixed(2) === t.entry.toFixed(2) ? 'Stop (BE)' : 'Stop';
+  return `<div class="trade">
+    <div class="top"><span class="dir ${long ? 'long' : 'short'}">${long ? '▲ LONG' : '▼ SHORT'}</span>
+      <span class="tag">${manual ? 'MANUAL' : esc(t.strategy || 'BOT')}</span>
+      ${t.days_open > 0 ? `<span class="tag warn">${esc(t.days_open)}d open</span>` : ''}
+      <span class="pnl ${pnl >= 0 ? 'up' : 'down'}">${signed(pnl)}</span></div>
+    <div class="kv"><div>Entry<b>${money(t.entry)}</b></div><div>${stopLbl}<b class="down">${money(t.stop)}</b></div><div>Target<b class="up">${money(t.target)}</b></div><div>Qty<b>${esc(t.qty)}</b></div></div>
+    ${prog}
+    <div class="row" style="margin-top:10px;font-size:12px"><span class="muted">${esc(t.opened_at || '')}</span><div class="spacer"></div>
+      ${isOpen ? '' : `<span class="tag">${esc(t.outcome)}</span>`}
+      ${manual && isOpen ? `<button class="btn stop sm" onclick="openCloseModal('${esc(t.id || '')}')">Close</button>` : ''}</div>
+  </div>`;
+}
+
+function renderOffline(err) {
+  const mk = $('#tb-market'); mk.className = 'pill'; mk.lastElementChild.textContent = 'No data';
+  $('#st-status').textContent = APP.standalone ? 'Bot not responding' : (botStatus && botStatus.running ? 'Bot starting up…' : 'Bot is stopped');
+}
+
+/* ── bot control (panel only) ────────────────────────────── */
+async function pollBot() {
+  if (APP.standalone) return;
+  const r = await api('/api/bot/status', undefined, { timeout: 4000 });
+  if (r.status !== 200) { botStatus = null; renderBot(); return; }
+  botStatus = r.data; renderBot();
+}
+function fmtUp(s) { const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60); return h ? `${h}h ${m}m` : `${m}m ${s % 60}s`; }
+function renderBot() {
+  const pill = $('#tb-bot'), txt = $('#tb-bot-text'), btn = $('#btn-bot');
+  if (APP.standalone) { pill.className = 'pill ' + (D ? 'ok' : 'bad'); txt.textContent = D ? 'Bot running' : 'Bot offline'; return; }
+  const b = botStatus;
+  if (!b) { pill.className = 'pill bad'; txt.textContent = 'Panel offline'; btn.disabled = true; return; }
+  btn.disabled = false;
+  if (b.running) {
+    pill.className = 'pill ' + (D ? 'ok' : 'wait'); txt.textContent = D ? `Running · ${fmtUp(b.uptime_s)}` : 'Starting…';
+    btn.className = 'btn stop panel-only'; btn.textContent = '■ Stop Bot';
+  } else if (D) {
+    pill.className = 'pill ok'; txt.textContent = 'Running outside panel';
+    btn.className = 'btn go panel-only'; btn.textContent = '▶ Start Bot';
+  } else {
+    pill.className = 'pill ' + (b.desired ? 'wait' : 'bad'); txt.textContent = b.desired ? 'Restarting…' : 'Stopped';
+    btn.className = 'btn go panel-only'; btn.textContent = '▶ Start Bot';
+  }
+  const mode = b.mode || 'paper', m = $('#tb-mode');
+  m.className = 'pill ' + (mode === 'live' ? 'live' : 'paper'); m.textContent = mode === 'live' ? 'LIVE MONEY' : 'PAPER';
+  $('#side-foot').textContent = b.restarts ? `Auto-restarts: ${b.restarts}` : 'Data refreshes every 5s';
+}
+async function toggleBot() {
+  const btn = $('#btn-bot'); btn.disabled = true;
+  if (botStatus && botStatus.running) {
+    const open = D && (D.active_trades || []).length;
+    if (open && !confirm('A position is open. Stopping the bot leaves it open on Alpaca.\n\nLongs keep their bracket stop/target on Alpaca. SHORTS HAVE NO PROTECTION while the bot is stopped.\n\nStop anyway?')) { btn.disabled = false; return; }
+    const r = await api('/api/bot/stop', {}, { timeout: 20000 });
+    toast(r.data.ok ? 'Bot stopped' : (r.data.error || 'Could not stop the bot'), r.data.ok ? 'ok' : 'err');
+  } else {
+    const r = await api('/api/bot/start', {});
+    if (r.data.ok) toast('Bot starting — watch the Console tab');
+    else { toast(r.data.error || 'Could not start the bot', 'err'); if ((r.data.error || '').includes('keys')) showView('settings'); }
+  }
+  await pollBot(); btn.disabled = false;
+}
+
+function renderBanners() {
+  const out = [];
+  if (!APP.standalone && botStatus) {
+    if (!botStatus.keys_set) out.push(`<div class="banner warn"><b>Add your Alpaca keys to get started.</b><span class="grow t2">They're saved on this computer only.</span><button class="btn primary sm" onclick="showView('settings')">Open Settings</button></div>`);
+    else if (!botStatus.running && D) out.push(`<div class="banner warn"><span class="grow"><b>A bot started outside this panel is running</b> <span class="t2">(e.g. an old Task Scheduler entry for nvda_autotrader.py). Data is live, but Start/Stop can't control it.</span></span></div>`);
+    else if (!botStatus.running && !botStatus.desired) out.push(`<div class="banner"><span class="grow"><b>The bot is stopped.</b> <span class="t2">${esc(botStatus.last_exit_note || 'Click Start Bot to begin scanning.')}</span></span><button class="btn go sm" onclick="toggleBot()">▶ Start Bot</button></div>`);
+    if (botStatus.running && botStatus.saved_mode !== botStatus.mode) out.push(`<div class="banner warn"><span class="grow">Settings changed to <b>${esc(botStatus.saved_mode.toUpperCase())}</b> — restart the bot to apply.</span><button class="btn sm" onclick="restartBot()">Restart now</button></div>`);
+    if (botStatus.mode === 'live') out.push(`<div class="banner live"><b>LIVE MONEY</b><span class="grow">Orders placed by the bot use real funds.</span></div>`);
+  }
+  if (APP.standalone) out.push(`<div class="banner"><span class="grow t2">Bot-only view. Run <span class="mono">python build_dashboard.py</span> for Start/Stop, Settings and the console.</span></div>`);
+  const html = out.join('');
+  if ($('#banners').innerHTML !== html) $('#banners').innerHTML = html;
+}
+async function restartBot() {
+  const r = await api('/api/bot/restart', {}, { timeout: 25000 });
+  toast(r.data.ok ? 'Bot restarted with new settings' : (r.data.error || 'Restart failed'), r.data.ok ? 'ok' : 'err');
+  pollBot();
+}
+
+/* ── console ─────────────────────────────────────────────── */
+let conAfter = 0, conLines = [], conFilter = 'all';
+const lvlOf = l => l.startsWith('[panel') ? 'PANEL' : ((l.match(/\] (INFO|WARN|ERROR|TRADE|CRITICAL):/) || [])[1] || 'INFO');
+async function pollConsole() {
+  if (APP.standalone) return;
+  const r = await api('/api/bot/console?after=' + conAfter, undefined, { timeout: 4000 });
+  if (r.status !== 200) return;
+  if (r.data.last < conAfter) { conAfter = 0; conLines = []; }
+  if (!r.data.lines.length) return;
+  conAfter = r.data.lines[r.data.lines.length - 1].n;
+  conLines = conLines.concat(r.data.lines.map(x => x.line)).slice(-3000);
+  renderConsole();
+}
+function renderConsole() {
+  const el = $('#console');
+  const rows = conLines.filter(l => conFilter === 'all' || lvlOf(l) === conFilter || (conFilter === 'ERROR' && lvlOf(l) === 'CRITICAL'));
+  el.innerHTML = rows.length ? rows.map(l => `<div class="${lvlOf(l)}">${esc(l)}</div>`).join('') : '<span class="muted">Nothing here yet.</span>';
+  scrollConsole();
+}
+function scrollConsole() { if ($('#con-follow').checked) { const el = $('#console'); el.scrollTop = el.scrollHeight; } }
+$$('#con-filter button').forEach(b => b.addEventListener('click', () => { $$('#con-filter button').forEach(x => x.classList.toggle('on', x === b)); conFilter = b.dataset.f; renderConsole(); }));
+
+/* ── settings ────────────────────────────────────────────── */
+let pendingMode = 'paper';
+function segSet(sel, attr, val) { $$(sel + ' button').forEach(b => b.classList.toggle('on', b.dataset[attr] === val)); }
+async function loadSettings() {
+  if (APP.standalone) return;
+  const r = await api('/api/settings');
+  if (r.status !== 200) return;
+  settings = r.data;
+  pendingMode = settings.trading_mode;
+  segSet('#set-mode', 'm', settings.trading_mode);
+  segSet('#set-src', 's', settings.signal_source);
+  srcHint(settings.signal_source);
+  $('#set-restart').checked = settings.auto_restart;
+  $('#set-file').textContent = settings.settings_file;
+  $('#set-key').placeholder = settings.has_api_key ? settings.api_key_masked + '  (saved)' : 'PK…';
+  $('#set-secret').placeholder = settings.has_secret ? '•••••••• (saved)' : 'Paste secret key';
+  const ks = $('#set-keystate');
+  ks.className = 'pill ' + (settings.has_api_key && settings.has_secret ? 'ok' : 'bad');
+  ks.innerHTML = `<span class="dot"></span>${settings.has_api_key && settings.has_secret ? 'Keys saved' : 'No keys'}`;
+  $('#tv-enabled').checked = settings.tv_enabled;
+  $('#tv-pass').value = settings.tv_passphrase || '';
+  $('#tv-port').value = settings.tv_port;
+  $('#tv-url').value = settings.tv_public_url || '';
+  renderTVInfo();
+}
+function srcHint(s) {
+  $('#set-src-hint').textContent = {
+    bot: 'The bot runs its own 6 strategies in the kill zones (current behaviour).',
+    tradingview: 'The bot only executes TradingView alerts. Its own strategies stay off. Turn on alerts in the TradingView tab.',
+    both: 'Both the bot\'s strategies and TradingView alerts can open trades (one position at a time).'
+  }[s];
+}
+$$('#set-mode button').forEach(b => b.addEventListener('click', () => {
+  if (b.dataset.m === 'live' && settings && settings.trading_mode !== 'live') { $('#live-confirm').value = ''; $('#m-live').classList.remove('hidden'); return; }
+  pendingMode = b.dataset.m; segSet('#set-mode', 'm', pendingMode);
+  if (settings && settings.trading_mode === 'live' && pendingMode === 'paper') saveKeys(true);
+}));
+$$('#set-src button').forEach(b => b.addEventListener('click', () => { segSet('#set-src', 's', b.dataset.s); srcHint(b.dataset.s); }));
+function cancelLive() { $('#m-live').classList.add('hidden'); segSet('#set-mode', 'm', pendingMode); }
+async function confirmLive() {
+  if ($('#live-confirm').value.trim() !== 'LIVE') { toast('Type LIVE to confirm', 'err'); return; }
+  $('#m-live').classList.add('hidden');
+  const r = await api('/api/settings', { trading_mode: 'live', confirm_live: true });
+  if (r.data.ok) { toast('Switched to LIVE. Enter your live keys and restart the bot.'); pendingMode = 'live'; }
+  else toast(r.data.error || 'Could not switch', 'err');
+  loadSettings();
+}
+function toggleSecret() { const i = $('#set-secret'); i.type = i.type === 'password' ? 'text' : 'password'; $('#btn-show').textContent = i.type === 'password' ? 'Show' : 'Hide'; }
+async function testKeys() {
+  const b = $('#btn-test'); b.disabled = true; b.textContent = 'Testing…';
+  const r = await api('/api/test_keys', { alpaca_api_key: $('#set-key').value, alpaca_secret_key: $('#set-secret').value, trading_mode: pendingMode }, { timeout: 20000 });
+  const d = r.data;
+  showMsg('#set-msg', d.ok ? `Connected to ${d.mode.toUpperCase()} account ${d.account} · equity ${money(d.equity)} · status ${d.status}${d.pattern_day_trader ? ' · flagged PDT' : ''}` : d.error, d.ok);
+  b.disabled = false; b.textContent = 'Test connection';
+}
+async function saveKeys(quiet) {
+  const body = { trading_mode: pendingMode };
+  const k = $('#set-key').value.trim(), s = $('#set-secret').value.trim();
+  if (k) body.alpaca_api_key = k;
+  if (s) body.alpaca_secret_key = s;
+  const r = await api('/api/settings', body);
+  if (r.data.ok) {
+    $('#set-key').value = ''; $('#set-secret').value = '';
+    if (!quiet) showMsg('#set-msg', r.data.restart_needed ? 'Saved. Restart the bot to use the new keys.' : 'Saved. Click Start Bot when ready.', true);
+    loadSettings(); pollBot();
+  } else showMsg('#set-msg', r.data.error || 'Could not save', false);
+}
+async function clearKeys() {
+  if (!confirm('Remove the saved Alpaca keys from this computer?')) return;
+  const r = await api('/api/settings', { clear_keys: true });
+  showMsg('#set-msg', r.data.ok ? 'Keys removed.' : r.data.error, r.data.ok); loadSettings(); pollBot();
+}
+async function saveBehaviour() {
+  const src = ($$('#set-src button').find(b => b.classList.contains('on')) || {}).dataset?.s || 'bot';
+  const r = await api('/api/settings', { signal_source: src, auto_restart: $('#set-restart').checked });
+  showMsg('#set-msg2', r.data.ok ? (r.data.restart_needed ? 'Saved. Restart the bot to apply.' : 'Saved.') : r.data.error, r.data.ok);
+  loadSettings();
+}
+
+/* ── TradingView ─────────────────────────────────────────── */
+let pineText = null;
+async function loadPine() {
+  if (pineText !== null) return;
+  const r = await api('/api/pine');
+  if (APP.standalone || r.status !== 200) { $('#pine-code').textContent = 'Open nvda_strategy.pine from the project folder (served by the control panel only).'; return; }
+  pineText = r.data; $('#pine-code').textContent = pineText;
+}
+async function copyPine() { await loadPine(); if (pineText) { await navigator.clipboard.writeText(pineText); toast('Pine Script copied — paste it into TradingView\'s Pine Editor'); } }
+async function downloadPine() {
+  await loadPine(); if (!pineText) return;
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([pineText], { type: 'text/plain' })); a.download = 'nvda_strategy.pine'; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+function renderTVInfo() {
+  const port = $('#tv-port').value || 8090, url = ($('#tv-url').value || '').replace(/\/+$/, '');
+  $('#cmd-ngrok').textContent = `ngrok http ${port}`;
+  $('#cmd-cf').textContent = `cloudflared tunnel --url http://127.0.0.1:${port}`;
+  $('#tv-hook').textContent = (url || 'https://YOUR-TUNNEL') + '/tv_webhook';
+  const st = $('#tv-state'), on = settings && settings.tv_enabled;
+  st.className = 'pill ' + (on ? 'ok' : ''); st.innerHTML = `<span class="dot"></span>${on ? 'Enabled' : 'Off'}`;
+}
+['#tv-port', '#tv-url'].forEach(s => $(s).addEventListener('input', renderTVInfo));
+async function genPass() { const r = await api('/api/generate_passphrase', {}); if (r.data.ok) $('#tv-pass').value = r.data.passphrase; }
+async function saveTV() {
+  const r = await api('/api/settings', { tv_enabled: $('#tv-enabled').checked, tv_passphrase: $('#tv-pass').value, tv_port: parseInt($('#tv-port').value || '8090', 10), tv_public_url: $('#tv-url').value });
+  showMsg('#tv-msg', r.data.ok ? (r.data.restart_needed ? 'Saved. Restart the bot to apply.' : 'Saved.') : r.data.error, r.data.ok);
+  loadSettings();
+}
+function copyText(id) { navigator.clipboard.writeText($('#' + id).textContent).then(() => toast('Copied')); }
+function copyVal(id) { navigator.clipboard.writeText($('#' + id).value).then(() => toast('Copied')); }
+
+/* ── manual trade modal ──────────────────────────────────── */
+let mDir = null, mMult = 1, mManaged = true, mPx = 0, mPoll = null;
+function openTradeModal() {
+  mDir = null; ['#m-long', '#m-short'].forEach(s => $(s).classList.remove('on'));
+  showMsg('#m-msg', ''); $('#m-trail').checked = false;
+  $('#m-trade').classList.remove('hidden');
+  fetchLivePx(); mPoll = setInterval(fetchLivePx, 4000);
+  updatePreview();
+}
+function closeTradeModal() { $('#m-trade').classList.add('hidden'); clearInterval(mPoll); mPoll = null; }
+async function fetchLivePx() {
+  const r = await api('/live_price', undefined, { timeout: 4000 });
+  if (r.data && r.data.price > 0) { mPx = r.data.price; $('#m-px').textContent = money(mPx); $('#m-px-note').textContent = 'last trade · updates every 4s'; }
+  else $('#m-px-note').textContent = r.data.error || 'unavailable';
+  updatePreview();
+}
+function setDir(d) { mDir = d; $('#m-long').classList.toggle('on', d === 'bullish'); $('#m-short').classList.toggle('on', d === 'bearish'); updatePreview(); }
+function toggleAtr() { const a = $('#m-atr').checked; $('#m-atr-row').classList.toggle('hidden', !a); $('#m-manual').classList.toggle('hidden', a); updatePreview(); }
+$$('#m-mult button').forEach(b => b.addEventListener('click', () => { mMult = parseFloat(b.dataset.x); segSet('#m-mult', 'x', b.dataset.x); updatePreview(); }));
+$$('#m-managed button').forEach(b => b.addEventListener('click', () => { mManaged = b.dataset.v === '1'; segSet('#m-managed', 'v', b.dataset.v); $('#m-trail-row').classList.toggle('hidden', !mManaged); }));
+function levels() {
+  const atr = D ? D.last_atr : 0;
+  if ($('#m-atr').checked) {
+    if (!atr || !mPx || !mDir) return null;
+    const sd = mMult * atr, td = sd * 1.5;
+    return mDir === 'bullish' ? { stop: mPx - sd, target: mPx + td } : { stop: mPx + sd, target: mPx - td };
+  }
+  const stop = parseFloat($('#m-stop').value), target = parseFloat($('#m-target').value);
+  return stop && target ? { stop, target } : null;
+}
+function updatePreview() {
+  const p = $('#m-preview'), atr = D ? D.last_atr : 0;
+  $('#m-atr-note').textContent = atr ? `ATR is $${Number(atr).toFixed(3)} · target = 1.5 × stop distance` : 'ATR not available until the bot has scanned once';
+  if (!mDir) { p.textContent = 'Pick LONG or SHORT.'; p.style.color = ''; return; }
+  const lv = levels(), qty = parseInt($('#m-qty').value || '0', 10);
+  if (!lv || !mPx) { p.textContent = $('#m-atr').checked ? 'Waiting for live price / ATR…' : `For a ${mDir === 'bullish' ? 'LONG' : 'SHORT'}: ${mDir === 'bullish' ? 'stop below, target above' : 'target below, stop above'} ${money(mPx)}`; p.style.color = ''; return; }
+  const ok = mDir === 'bullish' ? lv.stop < mPx && mPx < lv.target : lv.target < mPx && mPx < lv.stop;
+  const risk = Math.abs(mPx - lv.stop) * qty, reward = Math.abs(lv.target - mPx) * qty;
+  p.innerHTML = ok
+    ? `Stop ${money(lv.stop)} · Target ${money(lv.target)}<br>Risk <span class="down">${money(risk)}</span> · Reward <span class="up">${money(reward)}</span> · ${(reward / (risk || 1)).toFixed(2)}R · ${money(mPx * qty, 0)} position`
+    : `<span class="down">Stop/target don't bracket the live price for a ${mDir === 'bullish' ? 'LONG (need stop < price < target)' : 'SHORT (need target < price < stop)'}.</span>`;
+}
+async function submitTrade() {
+  if (!mDir) return showMsg('#m-msg', 'Pick LONG or SHORT', false);
+  const qty = parseInt($('#m-qty').value || '0', 10);
+  if (!qty || qty < 1) return showMsg('#m-msg', 'Enter a share quantity', false);
+  const useAtr = $('#m-atr').checked, lv = levels();
+  if (!useAtr && !lv) return showMsg('#m-msg', 'Enter stop and target', false);
+  const b = $('#m-submit'); b.disabled = true; b.textContent = 'Placing…';
+  const r = await api('/manual_trade', { direction: mDir, qty, use_atr: useAtr, atr_mult: mMult, stop: useAtr ? 0 : lv.stop, target: useAtr ? 0 : lv.target, managed: mManaged, use_trail: mManaged && $('#m-trail').checked }, { timeout: 60000 });
+  b.disabled = false; b.textContent = 'Place order';
+  if (r.data.ok) { showMsg('#m-msg', r.data.message, true); setTimeout(closeTradeModal, 1500); pollData(); }
+  else showMsg('#m-msg', r.data.error || 'Order failed', false);
+}
+
+/* ── close modal ─────────────────────────────────────────── */
+let closeId = '';
+function openCloseModal(id) { closeId = id || ''; $('#c-pnl').value = ''; showMsg('#c-msg', ''); $('#m-close').classList.remove('hidden'); }
+function closeCloseModal() { $('#m-close').classList.add('hidden'); }
+async function submitClose() {
+  const b = $('#c-submit'); b.disabled = true; b.textContent = 'Closing…';
+  const r = await api('/close_manual_trade', { order_id: closeId, pnl: parseFloat($('#c-pnl').value) || 0 }, { timeout: 30000 });
+  b.disabled = false; b.textContent = 'Close position';
+  if (r.data.ok) { closeCloseModal(); toast('Position closed'); pollData(); } else showMsg('#c-msg', r.data.error || 'Close failed', false);
+}
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeTradeModal(); closeCloseModal(); } });
+
+/* ── start ───────────────────────────────────────────────── */
+window.addEventListener('load', () => {
+  if (APP.standalone) $$('.panel-only').forEach(e => e.classList.add('hidden'));
+  initChart();
+  showView((location.hash || '#overview').slice(1));
+  loadSettings(); pollBot(); loadHistoryOnce(); pollData(); renderKZ();
+  setInterval(pollData, 5000);
+  setInterval(pollBot, 3000);
+  setInterval(() => { if ($('#view-console').classList.contains('active') || conAfter === 0) pollConsole(); }, 2000);
+  setInterval(renderKZ, 30000);
+});
+"""
+
+
+# ═══════════════════════════════════════════════════════════════
+# RENDER
+# ═══════════════════════════════════════════════════════════════
+
+def render_html(standalone=False):
+    body = BODY_HTML.replace("__VERSION__", VERSION)
+    for name, svg in ICONS.items():
+        body = body.replace(f"__I_{name}__", svg)
+    js = JS.replace("__STANDALONE__", "true" if standalone else "false").replace("__VERSION__", VERSION)
+    return f"""<!DOCTYPE html>
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>NVDA AutoTrader — Live Dashboard</title>
+<title>NVDA AutoTrader</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b8cff'/%3E%3Cpath d='M7 21l6-6 4 4 8-9' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-<style>
-{get_css()}
-</style>
+<style>{CSS}</style>
 </head>
 <body>
-{body_html}
-<script>
-{get_js(history)}
-</script>
+{body}
+<script>{js}</script>
 </body>
 </html>"""
 
-    out_file = os.path.join(os.path.dirname(__file__), DASHBOARD_FILE)
-    with open(out_file, "w", encoding="utf-8") as f:
-        f.write(html)
 
-    size_kb = os.path.getsize(out_file) // 1024
-    print(f"  Written: {DASHBOARD_FILE} ({size_kb} KB)")
-    print(f"  Done")
+def build():
+    """Legacy: write the dashboard to nvda_live_dashboard.html (bot-only mode)."""
+    with open(DASHBOARD_FILE, "w", encoding="utf-8") as f:
+        f.write(render_html(standalone=True))
+    print(f"  Written: {os.path.basename(DASHBOARD_FILE)} ({os.path.getsize(DASHBOARD_FILE) // 1024} KB)")
+
+
+# ═══════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════
+
+def main():
+    ap = argparse.ArgumentParser(description="NVDA AutoTrader control panel")
+    ap.add_argument("--port", type=int, default=PANEL_PORT, help="dashboard port (default 8080)")
+    ap.add_argument("--autostart", action="store_true", help="start the bot as soon as the panel opens")
+    ap.add_argument("--no-browser", action="store_true", help="don't open a browser window")
+    ap.add_argument("--build-only", action="store_true", help="just write nvda_live_dashboard.html and exit")
+    args = ap.parse_args()
+
+    if args.build_only:
+        build()
+        return
+
+    try:
+        server = ThreadingHTTPServer((PANEL_HOST, args.port), PanelHandler)
+    except OSError as e:
+        print(f"\nERROR: port {args.port} is busy ({e}).")
+        print("  Is the panel already open, or is an old copy of nvda_autotrader.py")
+        print("  still running from Task Scheduler? Close it, or use --port 8085.")
+        sys.exit(1)
+    server.daemon_threads = True
+
+    url = f"http://{PANEL_HOST}:{args.port}"
+    print("\n" + "=" * 55)
+    print(f"  NVDA AutoTrader control panel {VERSION}")
+    print(f"  Dashboard: {url}")
+    print("  Press Ctrl+C here to quit (stops the bot too).")
+    print("=" * 55 + "\n")
+
+    if args.autostart:
+        try:
+            BOT.start(reason="auto-started with the panel")
+        except Exception as e:
+            print(f"  Could not auto-start the bot: {e}")
+    if not args.no_browser:
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down…")
+    finally:
+        BOT.stop()
+        server.server_close()
 
 
 if __name__ == "__main__":
-    build()
+    main()

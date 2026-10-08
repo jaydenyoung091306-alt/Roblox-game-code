@@ -1,5 +1,5 @@
 """
-NVDA DUAL-STRATEGY AUTO TRADER v4.97
+NVDA DUAL-STRATEGY AUTO TRADER v4.98
 ======================================================
 
 CLAUDE AI CONTEXT — READ THIS FIRST IF STARTING A NEW CHAT
@@ -8,21 +8,28 @@ This is a two-file algorithmic paper trading system for NVDA stock.
 The companion file is build_dashboard.py — always keep versions in sync.
 
 FILES (all in the same project folder):
-  nvda_autotrader.py        — This file (current version: v4.97)
-  build_dashboard.py        — Generates nvda_live_dashboard.html (v4.97)
-  nvda_live_dashboard.html  — Generated dashboard HTML (never edit directly)
+  nvda_autotrader.py        — This file (current version: v4.98)
+  build_dashboard.py        — Control panel + dashboard UI (v4.98). Starts/stops
+                              this bot and holds the API keys.
+  nvda_strategy.pine        — TradingView Pine Script port of the strategies
+  nvda_settings.json        — Keys + settings saved by the control panel
+                              (local only — never commit or share it)
   nvda_price_history.json   — Rolling 2000-point price history {"t":ts,"p":price}
   nvda_bot_state.json       — Persisted session state
   trade_logs/               — Daily .txt summaries + master_trade_log.csv
 
-HOW TO RUN:
-  Start:   cd %USERPROFILE%\\Downloads\\NVDA && python nvda_autotrader.py
-  Dashboard: http://localhost:8080  (NOT by opening the HTML file directly)
-  Task Scheduler runs bot at 8:20 AM daily.
+HOW TO RUN (v4.98):
+  Start:   cd %USERPROFILE%\\Downloads\\NVDA && python build_dashboard.py
+           → opens http://127.0.0.1:8080. Enter keys in Settings, click Start Bot.
+  Headless (Task Scheduler at 8:20 AM): python build_dashboard.py --autostart --no-browser
+  This file can still be run on its own (python nvda_autotrader.py) — it reads
+  the keys saved by the control panel and serves the same UI on 127.0.0.1:8080.
   After 4 PM ET: bot stays alive serving dashboard until midnight (no trading).
 
 BROKER & DATA:
-  Alpaca paper trading. Keys in ALPACA_API_KEY / ALPACA_BASE_URL below.
+  Alpaca paper trading. Keys come from the control panel (env vars or
+  nvda_settings.json) — see the API KEYS section below. Paper/live is a
+  Settings toggle, not a code edit.
   Data: Alpaca IEX free feed. YFinance fallback for QQQ/MTF.
   Live switch: change ALPACA_BASE_URL to api.alpaca.markets + live keys.
 
@@ -58,8 +65,11 @@ ORDER / EXIT LOGIC:
   5-min cooldown after any spike/extreme attempt (state["_spike_cooldown_until"])
 
 DASHBOARD (build_dashboard.py):
-  Served by HTTPServer bound to '' (all interfaces) on port 8080.
-  IMPORTANT: bind to '' not 'localhost' — Windows IPv6/IPv4 issue.
+  The control panel (build_dashboard.py) serves the UI on 127.0.0.1:8080 and
+  proxies to this bot's server on 127.0.0.1:8081 (8080 when run standalone).
+  IMPORTANT: bind to '127.0.0.1' (not 'localhost', Windows IPv6/IPv4 issue;
+  not '' — that exposes order placement to the whole network). Open the
+  dashboard as http://127.0.0.1:8080.
   ATR multiplier selector: 0.5× 1× 1.5× 2× 2.5× with live preview.
   Manual trade modal sends atr_mult to bot; bot uses it in calculation.
   After editing build_dashboard.py, run: python build_dashboard.py
@@ -67,7 +77,8 @@ DASHBOARD (build_dashboard.py):
 IMPORTANT RULES FOR CLAUDE:
   - ALWAYS bump VERSION in both files when making any change
   - ALWAYS syntax-check before presenting: python3 -c "import ast; ast.parse(open('f').read())"
-  - HTTPServer must bind to '' not 'localhost'
+  - HTTP servers bind to '127.0.0.1' (never '' or 'localhost'), no CORS headers
+  - Never put API keys in code — they live in nvda_settings.json via the dashboard
   - Short bracket orders are NOT supported on IEX free tier — use plain market sell
   - _check_spike_reversal and _check_range_extreme both return:
     ("bullish"/"bearish", entry, stop, target, risk, reason) or None
@@ -91,6 +102,33 @@ KEY CONFIG (see CONFIG dict below):
   extreme_proximity_mult: 0.5   within 0.5×ATR of extreme to trigger
 
 CHANGELOG:
+  v4.98 — Control panel, keys out of the code, TradingView, dashboard lockdown:
+             1) build_dashboard.py is now the app: `python build_dashboard.py`
+                serves a redesigned dashboard on 127.0.0.1:8080 with Start /
+                Stop / auto-restart for this bot, a live console, and a
+                Settings tab for Alpaca keys + paper/live. Keys are saved to
+                nvda_settings.json and handed to this process as environment
+                variables; ALPACA_API_KEY etc. are no longer edited in code.
+             2) Security: the dashboard server bound to every interface and
+                sent "Access-Control-Allow-Origin: *" with unauthenticated
+                POST /manual_trade — any device on the wifi, or any website
+                open in the browser, could place orders. Now loopback-only
+                by default (NVDA_BOT_HOST), no CORS, Host checked against
+                DNS rebinding, and POSTs must be same-origin JSON.
+             3) TradingView: new webhook receiver (start_tradingview_webhook)
+                turns TradingView alert JSON into Alpaca orders through the
+                same checks as a dashboard manual trade. Passphrase-protected,
+                off unless enabled in Settings. SIGNAL_SOURCE picks whether
+                trades come from the bot's strategies, TradingView, or both.
+                nvda_strategy.pine ports the strategies to Pine Script.
+             4) Refactor: /manual_trade and /close_manual_trade logic moved
+                into open_manual_trade() / close_manual_trade() (shared with
+                the webhook), serialized by _TRADE_ACTION_LOCK because the
+                dashboard server is now ThreadingHTTPServer — a slow request
+                (see v4.83) no longer freezes every other dashboard poll.
+             5) Exit codes: missing keys → 2, Alpaca connect failure → 3 (was
+                0) so the control panel can tell "fix your keys" apart from a
+                crash worth auto-restarting.
   v4.97 — Three compounding bugs, all surfaced by the v4.96 watchdog doing
            its job and force-restarting mid-SWING-6M-hold on 2026-10-02,
            which then exposed each of these in turn (caught live by the
@@ -1496,18 +1534,57 @@ _os.environ.setdefault("PYTHONWARNINGS", "ignore::FutureWarning,ignore::Deprecat
 from zoneinfo import ZoneInfo
 
 # ═══════════════════════════════════════════════════════════════
-# ─────────────── YOUR API KEYS — EDIT HERE ───────────────────
+# ─────────────── API KEYS — SET FROM THE DASHBOARD ───────────
 # ═══════════════════════════════════════════════════════════════
+# v4.98: keys are no longer edited into this file. They come from (first
+# match wins):
+#   1. Environment variables ALPACA_API_KEY / ALPACA_SECRET_KEY /
+#      ALPACA_BASE_URL — this is how the control panel (build_dashboard.py)
+#      passes them when you click Start Bot.
+#   2. nvda_settings.json next to this file — written by the control panel's
+#      Settings tab, so running this file directly (e.g. from Task Scheduler)
+#      picks up the same keys.
+# Change keys in the dashboard's Settings tab; never commit nvda_settings.json.
 
-ALPACA_API_KEY    = ""
-ALPACA_SECRET_KEY = ""
-ALPACA_BASE_URL   = "https://paper-api.alpaca.markets"
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nvda_settings.json")
+PAPER_BASE_URL = "https://paper-api.alpaca.markets"
+LIVE_BASE_URL  = "https://api.alpaca.markets"
+
+
+def _load_settings_file():
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as _f:
+            _s = json.load(_f)
+            return _s if isinstance(_s, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+_SETTINGS = _load_settings_file()
+
+ALPACA_API_KEY    = os.environ.get("ALPACA_API_KEY")    or _SETTINGS.get("alpaca_api_key", "")
+ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY") or _SETTINGS.get("alpaca_secret_key", "")
+ALPACA_BASE_URL   = (os.environ.get("ALPACA_BASE_URL")
+                     or (LIVE_BASE_URL if _SETTINGS.get("trading_mode") == "live" else PAPER_BASE_URL))
 ALPACA_DATA_URL   = "https://data.alpaca.markets"
+IS_PAPER          = "paper-api" in ALPACA_BASE_URL
+
+# Where trade signals come from: "bot" (this file's own strategies),
+# "tradingview" (only TradingView webhook alerts open trades), or "both".
+SIGNAL_SOURCE = (os.environ.get("NVDA_SIGNAL_SOURCE") or _SETTINGS.get("signal_source") or "bot").lower()
+
+# TradingView webhook receiver — disabled unless a passphrase is set.
+TV_WEBHOOK_PASSPHRASE = os.environ.get("NVDA_TV_PASSPHRASE") or _SETTINGS.get("tv_passphrase", "")
+TV_WEBHOOK_PORT       = int(os.environ.get("NVDA_TV_PORT") or _SETTINGS.get("tv_port") or 8090)
+TV_WEBHOOK_ENABLED    = bool(TV_WEBHOOK_PASSPHRASE) and (
+    os.environ.get("NVDA_TV_ENABLED", "1" if _SETTINGS.get("tv_enabled") else "0") == "1")
 
 # ═══════════════════════════════════════════════════════════════
 # IMPORTS (continued)
 # ═══════════════════════════════════════════════════════════════
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
+import hmac
+import hashlib
 warnings.filterwarnings('ignore')
 
 STATE_FILE = os.path.join("trade_logs", "session_state.json")
@@ -2539,6 +2616,286 @@ def load_existing_log():
 # LIVE DASHBOARD SERVER
 # ═══════════════════════════════════════════════════════════════
 
+# v4.98: the dashboard server is now threaded and the TradingView webhook can
+# fire at the same moment as a dashboard click — serialize every manual
+# open/close so two requests can never interleave their Alpaca calls.
+_TRADE_ACTION_LOCK = threading.Lock()
+
+
+def open_manual_trade(*args, **kwargs):
+    with _TRADE_ACTION_LOCK:
+        return _open_manual_trade(*args, **kwargs)
+
+
+def close_manual_trade(*args, **kwargs):
+    with _TRADE_ACTION_LOCK:
+        return _close_manual_trade(*args, **kwargs)
+
+
+def _open_manual_trade(direction, stop, target, qty, managed=True, use_atr=False,
+                       atr_mult=1.0, use_trail=False, source="dashboard", note=""):
+    """
+    v4.98: shared by the dashboard's /manual_trade route and the TradingView
+    webhook (was inline in the HTTP handler). Places a real Alpaca order and
+    tracks it as a MANUAL trade. Raises ValueError with a user-facing message
+    on any rejection; returns {"entry", "stop", "target", "order_id"}.
+    """
+    direction = (direction or "").lower()
+    if direction not in ("bullish", "bearish") or qty <= 0:
+        raise ValueError("Invalid trade parameters")
+
+    # Guard: market must be open for real orders
+    if not is_market_open():
+        raise ValueError("Market is closed — manual orders only accepted during market hours (9:30 AM–4:00 PM ET)")
+
+    api_result = get_alpaca()
+    if api_result[0] is None:
+        raise ValueError("Cannot connect to Alpaca — check API keys")
+    api = api_result[0]
+
+    # v4.63 fix: entry is no longer trusted from the request body at all —
+    # the dashboard field it came from could be stale (modal left open,
+    # slow network, browser tab backgrounded). Always pull a fresh quote
+    # directly from Alpaca right here, right before submitting, so the
+    # actual entry used for stop/target math (and the sanity check below)
+    # reflects the real live price, not whatever the client last saw.
+    try:
+        _latest_trade = api.get_latest_trade(CONFIG["ticker"])
+        entry = float(_latest_trade.price)
+    except Exception as _pe:
+        raise ValueError(f"Could not fetch a live price to confirm entry — try again: {_pe}")
+    if entry <= 0:
+        raise ValueError("Could not get a valid live price — try again")
+
+    # Auto-calculate stop/target from ATR if requested
+    if use_atr:
+        atr = state.get("last_atr", 0)
+        if atr <= 0:
+            raise ValueError(
+                "ATR not available yet — bot needs at least one scan cycle. "
+                "Wait ~15 seconds and try again, or enter stop/target manually."
+            )
+        stop_dist = atr_mult * atr
+        tgt_dist  = stop_dist * CONFIG["risk_reward"]
+        if direction == "bullish":
+            stop   = round(entry - stop_dist, 2)
+            target = round(entry + tgt_dist, 2)
+        else:
+            stop   = round(entry + stop_dist, 2)
+            target = round(entry - tgt_dist, 2)
+
+    if stop <= 0 or target <= 0:
+        raise ValueError("Stop and target must be set — uncheck ATR to enter manually")
+
+    # v4.63 fix: sanity-check stop/target against the live entry price —
+    # this is what actually prevents "stale data → automatic loss" trades.
+    # If the levels don't bracket the real live price correctly (e.g. a
+    # target that's already behind entry because price moved since the
+    # values were set), reject before ever placing the order instead of
+    # letting it fill and close instantly for a loss.
+    #
+    # v4.77 fix: this rejection was never logged — it's raised and
+    # returned straight to the browser as a 400, so a real occurrence
+    # left zero trace in bot_console.log. Also, "the price likely
+    # moved" is a real cause but not the only (or most common, per a
+    # live report) one: manually-typed stop/target on the wrong side
+    # of price for the chosen direction (e.g. a SHORT's target above
+    # entry instead of below — the reverse of a LONG) produces this
+    # exact same rejection with the price never having moved at all.
+    # Message now covers both without asserting which one happened.
+    if direction == "bullish":
+        if not (stop < entry < target):
+            log(f"Manual trade rejected — bracket mismatch [LONG] entry=${entry:.2f} "
+                f"stop=${stop:.2f} target=${target:.2f} (need stop < price < target)", "WARN")
+            raise ValueError(
+                f"Live price is ${entry:.2f} — your stop (${stop:.2f}) and target "
+                f"(${target:.2f}) don't bracket it correctly for a LONG (need "
+                f"stop < price < target). Either the price moved, or stop/target got "
+                f"entered on the wrong side of it — please review and retry."
+            )
+    else:
+        if not (target < entry < stop):
+            log(f"Manual trade rejected — bracket mismatch [SHORT] entry=${entry:.2f} "
+                f"stop=${stop:.2f} target=${target:.2f} (need target < price < stop)", "WARN")
+            raise ValueError(
+                f"Live price is ${entry:.2f} — your stop (${stop:.2f}) and target "
+                f"(${target:.2f}) don't bracket it correctly for a SHORT (need "
+                f"target < price < stop). Either the price moved, or stop/target got "
+                f"entered on the wrong side of it — please review and retry."
+            )
+
+    # place_order raises on failure — the real Alpaca error propagates to the except block
+    order = place_order(api, direction, entry, stop, target, qty)
+
+    manual_trade = {
+        "fvg_type":    direction,
+        "strategy":    "MANUAL",
+        "entry":       entry,
+        "stop":        stop,
+        "orig_stop":   stop,       # preserve original stop for risk/breakeven calc
+        "target":      target,
+        "qty":         qty,
+        "outcome":     "OPEN",
+        "pnl":         0.0,
+        "opened_at":   datetime.now(MARKET_TZ),
+        "order_id":    order.id,   # real Alpaca order ID
+        "managed":     managed,
+        "use_trail":   use_trail,
+        "trail_active": False,
+        "trail_stop":   None,
+        "fvg":         {"score": 0, "notes": note or "Manual entry"},
+        "score_notes": note or f"Manual entry from {source}",
+        "source":      source,
+    }
+
+    add_active_trade(manual_trade)
+    state["traded_today"] = True
+    # v4.62 fix: manual trades were never immediately persisted —
+    # save_state() only ran via the periodic every-10-scans counter
+    # (during active kill-zone scanning) or on a later trade close.
+    # A restart shortly after opening a manual trade (before either
+    # of those fired) found nothing in session_state.json for it,
+    # forcing the ALPACA SYNC fallback to reconnect the real Alpaca
+    # position from scratch with fabricated generic stop/target —
+    # discarding the real ones set here. Saving immediately closes
+    # that window.
+    save_state()
+
+    log(f"MANUAL TRADE entered via {source} — {direction.upper()} "
+        f"| Entry ${entry:.2f} | Stop ${stop:.2f} | Target ${target:.2f} "
+        f"| Qty {qty} | Alpaca ID: {order.id}", "TRADE")
+
+    return {"entry": entry, "stop": stop, "target": target, "order_id": order.id}
+
+
+def _close_manual_trade(oid="", pnl=0.0):
+    """
+    v4.98: shared by /close_manual_trade and the TradingView webhook. Closes
+    the MANUAL trade matching oid (or the first MANUAL trade when oid is
+    empty) and waits for Alpaca to confirm. Raises ValueError on failure.
+    """
+    # Find the trade to close — by order_id if provided, else first MANUAL
+    target_trade = None
+    for t in get_active_trades():
+        if t.get("strategy") == "MANUAL":
+            if not oid or t.get("order_id") == oid:
+                target_trade = t
+                break
+
+    if target_trade:
+        # v4.53 fix: close_all() result was ignored and the trade was
+        # marked closed 1s later with no confirmation Alpaca actually
+        # closed the position — same desync risk v4.52 fixed elsewhere.
+        # Now waits for confirmation before proceeding; on failure to
+        # confirm, returns an error so the dashboard shows it wasn't
+        # closed instead of silently losing track of a real position.
+        api_result = get_alpaca()
+        if api_result[0] is not None:
+            api = api_result[0]
+            try:
+                # Cancel any open bracket orders first
+                open_orders = api.list_orders(status="open", symbols=[CONFIG["ticker"]])
+                for o in open_orders:
+                    api.cancel_order(o.id)
+            except Exception as e:
+                log(f"Could not cancel open orders on manual close: {e}", "WARN")
+            _close_ok = close_all(api)
+            if not _close_ok:
+                log(f"close_all() call failed for manual trade {target_trade.get('order_id','')}", "WARN")
+            _confirmed = False
+            for _cw in range(10):
+                time.sleep(1)
+                try:
+                    if get_position(api) is None:
+                        _confirmed = True
+                        break
+                except Exception:
+                    break
+            if not _confirmed:
+                raise ValueError(
+                    "Close submitted but Alpaca has not confirmed the position is gone yet — "
+                    "check Alpaca directly, then retry Confirm Close (bot has not marked this closed)."
+                )
+            log(f"Alpaca position closed for manual trade {target_trade.get('order_id','')}", "TRADE")
+
+        # Use the P&L you typed in the modal when provided (e.g. you closed
+        # the position yourself and know the real number). Otherwise fall
+        # back to an estimate from the bot's last cached price.
+        cur_px = state.get("last_price", target_trade["entry"])
+        if pnl:
+            log(f"Using user-provided P&L (${pnl:+.2f}) for manual trade {target_trade.get('order_id','')}", "TRADE")
+        else:
+            if target_trade.get("fvg_type") == "bullish":
+                pnl = round((cur_px - target_trade["entry"]) * target_trade["qty"], 2)
+            else:
+                pnl = round((target_trade["entry"] - cur_px) * target_trade["qty"], 2)
+
+        target_trade["outcome"] = "MANUAL_CLOSE"
+        target_trade["pnl"]     = pnl
+        target_trade["exit_px"] = cur_px
+        _finalize_trade_close(target_trade)
+        remove_active_trade(target_trade)
+        if not get_active_trades():
+            state["traded_today"] = False
+        state["trades_today"] = state.get("trades_today", 0) + 1
+        _record_day_trade()
+        state["daily_pnl"]    = state.get("daily_pnl", 0.0) + pnl
+        log(f"MANUAL TRADE closed | ID: {target_trade.get('order_id','')} | P&L: ${pnl:+.2f}", "TRADE")
+        return pnl
+    raise ValueError("No matching manual trade to close")
+
+
+# v4.98: the dashboard server used to bind to every network interface with
+# "Access-Control-Allow-Origin: *" on every response and no checks on POST —
+# so any device on the same wifi, or ANY website open in your browser, could
+# POST /manual_trade and place a real order. Now it binds to 127.0.0.1 by
+# default (override with NVDA_BOT_HOST), sends no CORS headers, and every
+# POST must be same-origin JSON. Cross-site pages can't send a JSON POST
+# without a CORS preflight, which this server never approves.
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
+
+
+def _host_only(host_header):
+    host_header = (host_header or "").strip().lower()
+    if host_header.startswith("["):                 # [::1]:8080
+        return host_header.split("]")[0] + "]"
+    return host_header.rsplit(":", 1)[0] if host_header.count(":") == 1 else host_header
+
+
+def request_is_trusted(handler, bind_host, is_post):
+    """Reject DNS-rebinding (Host) and cross-site (Origin / content type) requests."""
+    host = _host_only(handler.headers.get("Host"))
+    if bind_host in _LOOPBACK_HOSTS and host not in _LOOPBACK_HOSTS:
+        return False
+    if not is_post:
+        return True
+    ctype = (handler.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    if ctype != "application/json":
+        return False
+    origin = handler.headers.get("Origin")
+    if origin and origin.rstrip("/").lower() != "http://" + (handler.headers.get("Host") or "").lower():
+        return False
+    return True
+
+
+def _dashboard_html():
+    """The same UI the control panel serves, in bot-only mode (no Start/Stop/Settings)."""
+    try:
+        import build_dashboard
+        return build_dashboard.render_html(standalone=True).encode("utf-8")
+    except Exception as e:
+        log(f"Could not render dashboard from build_dashboard.py: {e}", "WARN")
+        dash_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "nvda_live_dashboard.html")
+        if os.path.exists(dash_path):
+            with open(dash_path, "rb") as f:
+                return f.read()
+        return None
+
+
+BOT_HTTP_HOST = os.environ.get("NVDA_BOT_HOST", "127.0.0.1")
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Suppress server access logs
@@ -2553,6 +2910,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
+        if not request_is_trusted(self, BOT_HTTP_HOST, is_post=False):
+            self.handle_error_response(403, "Forbidden")
+            return
         try:
             self._do_GET_inner()
         except Exception as e:
@@ -2563,7 +2923,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if self.path == '/data':
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
 
             trade = state.get("active_trade") or state.get("closed_trade")
@@ -2665,7 +3024,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
             # Full price history for dashboard offline use
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             hist = state.get("price_history", [])
             try:
@@ -2684,7 +3042,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
             # gets validated against are the same number, not two different feeds.
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             try:
                 api_result = get_alpaca()
@@ -2706,7 +3063,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
             # separate real fetch of daily bars from Alpaca.
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             try:
                 bars = _fetch_daily_bars_for_chart(CONFIG["ticker"], n_days=200)
@@ -2717,38 +3073,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except (ConnectionAbortedError, BrokenPipeError):
                 pass
         elif self.path == '/' or self.path == '/dashboard':
-            # Serve the dashboard HTML directly — this avoids browser CORS blocks
-            # that prevent file:// pages from POSTing to localhost
-            dash_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                     "nvda_live_dashboard.html")
-            if os.path.exists(dash_path):
+            html = _dashboard_html()
+            if html:
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/html; charset=utf-8')
-                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Cache-Control', 'no-store')
                 self.end_headers()
-                with open(dash_path, 'rb') as f:
-                    try:
-                        self.wfile.write(f.read())
-                    except (ConnectionAbortedError, BrokenPipeError):
-                        pass
+                try:
+                    self.wfile.write(html)
+                except (ConnectionAbortedError, BrokenPipeError):
+                    pass
             else:
                 self.send_response(404)
                 self.send_header('Content-Type', 'text/plain')
                 self.end_headers()
-                self.wfile.write(b'Dashboard HTML not found - run: python build_dashboard.py')
+                self.wfile.write(b'Dashboard not found - keep build_dashboard.py next to nvda_autotrader.py')
         else:
             self.send_response(404)
             self.end_headers()
 
     def do_OPTIONS(self):
-        """Handle CORS preflight requests from dashboard."""
-        self.send_response(200)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-        self.end_headers()
+        """No cross-origin access — the dashboard is always served same-origin."""
+        self.handle_error_response(405, "Method not allowed")
 
     def do_POST(self):
+        if not request_is_trusted(self, BOT_HTTP_HOST, is_post=True):
+            self.handle_error_response(403, "Forbidden")
+            return
         try:
             self._do_POST_inner()
         except Exception as e:
@@ -2761,253 +3112,56 @@ class DashboardHandler(BaseHTTPRequestHandler):
             try:
                 length  = int(self.headers.get('Content-Length', 0))
                 body    = json.loads(self.rfile.read(length).decode())
-
-                direction  = body.get("direction", "").lower()
-                stop       = float(body.get("stop", 0))
-                target     = float(body.get("target", 0))
-                qty        = int(body.get("qty", 0))
-                managed    = bool(body.get("managed", True))
-                use_atr    = bool(body.get("use_atr", False))
-                atr_mult   = float(body.get("atr_mult", 1.0))
-                use_trail  = bool(body.get("use_trail", False))
-
-                if direction not in ("bullish", "bearish") or qty <= 0:
-                    raise ValueError("Invalid trade parameters")
-
-                # Guard: market must be open for real orders
-                if not is_market_open():
-                    raise ValueError("Market is closed — manual orders only accepted during market hours (9:30 AM–4:00 PM ET)")
-
-                api_result = get_alpaca()
-                if api_result[0] is None:
-                    raise ValueError("Cannot connect to Alpaca — check API keys")
-                api = api_result[0]
-
-                # v4.63 fix: entry is no longer trusted from the request body at all —
-                # the dashboard field it came from could be stale (modal left open,
-                # slow network, browser tab backgrounded). Always pull a fresh quote
-                # directly from Alpaca right here, right before submitting, so the
-                # actual entry used for stop/target math (and the sanity check below)
-                # reflects the real live price, not whatever the client last saw.
-                try:
-                    _latest_trade = api.get_latest_trade(CONFIG["ticker"])
-                    entry = float(_latest_trade.price)
-                except Exception as _pe:
-                    raise ValueError(f"Could not fetch a live price to confirm entry — try again: {_pe}")
-                if entry <= 0:
-                    raise ValueError("Could not get a valid live price — try again")
-
-                # Auto-calculate stop/target from ATR if requested
-                if use_atr:
-                    atr = state.get("last_atr", 0)
-                    if atr <= 0:
-                        raise ValueError(
-                            "ATR not available yet — bot needs at least one scan cycle. "
-                            "Wait ~15 seconds and try again, or enter stop/target manually."
-                        )
-                    stop_dist = atr_mult * atr
-                    tgt_dist  = stop_dist * CONFIG["risk_reward"]
-                    if direction == "bullish":
-                        stop   = round(entry - stop_dist, 2)
-                        target = round(entry + tgt_dist, 2)
-                    else:
-                        stop   = round(entry + stop_dist, 2)
-                        target = round(entry - tgt_dist, 2)
-
-                if stop <= 0 or target <= 0:
-                    raise ValueError("Stop and target must be set — uncheck ATR to enter manually")
-
-                # v4.63 fix: sanity-check stop/target against the live entry price —
-                # this is what actually prevents "stale data → automatic loss" trades.
-                # If the levels don't bracket the real live price correctly (e.g. a
-                # target that's already behind entry because price moved since the
-                # values were set), reject before ever placing the order instead of
-                # letting it fill and close instantly for a loss.
-                #
-                # v4.77 fix: this rejection was never logged — it's raised and
-                # returned straight to the browser as a 400, so a real occurrence
-                # left zero trace in bot_console.log. Also, "the price likely
-                # moved" is a real cause but not the only (or most common, per a
-                # live report) one: manually-typed stop/target on the wrong side
-                # of price for the chosen direction (e.g. a SHORT's target above
-                # entry instead of below — the reverse of a LONG) produces this
-                # exact same rejection with the price never having moved at all.
-                # Message now covers both without asserting which one happened.
-                if direction == "bullish":
-                    if not (stop < entry < target):
-                        log(f"Manual trade rejected — bracket mismatch [LONG] entry=${entry:.2f} "
-                            f"stop=${stop:.2f} target=${target:.2f} (need stop < price < target)", "WARN")
-                        raise ValueError(
-                            f"Live price is ${entry:.2f} — your stop (${stop:.2f}) and target "
-                            f"(${target:.2f}) don't bracket it correctly for a LONG (need "
-                            f"stop < price < target). Either the price moved, or stop/target got "
-                            f"entered on the wrong side of it — please review and retry."
-                        )
-                else:
-                    if not (target < entry < stop):
-                        log(f"Manual trade rejected — bracket mismatch [SHORT] entry=${entry:.2f} "
-                            f"stop=${stop:.2f} target=${target:.2f} (need target < price < stop)", "WARN")
-                        raise ValueError(
-                            f"Live price is ${entry:.2f} — your stop (${stop:.2f}) and target "
-                            f"(${target:.2f}) don't bracket it correctly for a SHORT (need "
-                            f"target < price < stop). Either the price moved, or stop/target got "
-                            f"entered on the wrong side of it — please review and retry."
-                        )
-
-                # place_order raises on failure — the real Alpaca error propagates to the except block
-                order = place_order(api, direction, entry, stop, target, qty)
-
-                manual_trade = {
-                    "fvg_type":    direction,
-                    "strategy":    "MANUAL",
-                    "entry":       entry,
-                    "stop":        stop,
-                    "orig_stop":   stop,       # preserve original stop for risk/breakeven calc
-                    "target":      target,
-                    "qty":         qty,
-                    "outcome":     "OPEN",
-                    "pnl":         0.0,
-                    "opened_at":   datetime.now(MARKET_TZ),
-                    "order_id":    order.id,   # real Alpaca order ID
-                    "managed":     managed,
-                    "use_trail":   use_trail,
-                    "trail_active": False,
-                    "trail_stop":   None,
-                    "fvg":         {"score": 0, "notes": "Manual entry"},
-                    "score_notes": "Manual entry from dashboard",
-                }
-
-                add_active_trade(manual_trade)
-                state["traded_today"] = True
-                # v4.62 fix: manual trades were never immediately persisted —
-                # save_state() only ran via the periodic every-10-scans counter
-                # (during active kill-zone scanning) or on a later trade close.
-                # A restart shortly after opening a manual trade (before either
-                # of those fired) found nothing in session_state.json for it,
-                # forcing the ALPACA SYNC fallback to reconnect the real Alpaca
-                # position from scratch with fabricated generic stop/target —
-                # discarding the real ones set here. Saving immediately closes
-                # that window.
-                save_state()
-
-                log(f"MANUAL TRADE entered via dashboard — {direction.upper()} "
-                    f"| Entry ${entry:.2f} | Stop ${stop:.2f} | Target ${target:.2f} "
-                    f"| Qty {qty} | Alpaca ID: {order.id}", "TRADE")
-
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers()
-                self.wfile.write(json.dumps({
+                direction = body.get("direction", "").lower()
+                managed   = bool(body.get("managed", True))
+                result = open_manual_trade(
+                    direction,
+                    stop      = float(body.get("stop", 0) or 0),
+                    target    = float(body.get("target", 0) or 0),
+                    qty       = int(body.get("qty", 0) or 0),
+                    managed   = managed,
+                    use_atr   = bool(body.get("use_atr", False)),
+                    atr_mult  = float(body.get("atr_mult", 1.0) or 1.0),
+                    use_trail = bool(body.get("use_trail", False)),
+                    source    = "dashboard",
+                )
+                self._send_json(200, {
                     "ok": True,
-                    "message": f"Manual {direction} trade entered @ ${entry:.2f} "
+                    "message": f"Manual {direction} trade entered @ ${result['entry']:.2f} "
                                f"({'managed' if managed else 'log-only'})",
-                    "entry":  entry,
-                    "stop":   stop,
-                    "target": target,
-                }).encode())
-
+                    "entry":  result["entry"],
+                    "stop":   result["stop"],
+                    "target": result["target"],
+                })
             except Exception as e:
-                self.send_response(400)
-                self.send_header('Content-Type', 'application/json')
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers()
-                self.wfile.write(json.dumps({"ok": False, "error": str(e)}).encode())
+                self._send_json(400, {"ok": False, "error": str(e)})
 
         elif self.path == '/close_manual_trade':
             try:
                 length = int(self.headers.get('Content-Length', 0))
                 body   = json.loads(self.rfile.read(length).decode()) if length else {}
-                pnl    = float(body.get("pnl", 0))
-                oid    = body.get("order_id", "")
-
-                # Find the trade to close — by order_id if provided, else first MANUAL
-                target_trade = None
-                for t in get_active_trades():
-                    if t.get("strategy") == "MANUAL":
-                        if not oid or t.get("order_id") == oid:
-                            target_trade = t
-                            break
-
-                if target_trade:
-                    # v4.53 fix: close_all() result was ignored and the trade was
-                    # marked closed 1s later with no confirmation Alpaca actually
-                    # closed the position — same desync risk v4.52 fixed elsewhere.
-                    # Now waits for confirmation before proceeding; on failure to
-                    # confirm, returns an error so the dashboard shows it wasn't
-                    # closed instead of silently losing track of a real position.
-                    api_result = get_alpaca()
-                    if api_result[0] is not None:
-                        api = api_result[0]
-                        try:
-                            # Cancel any open bracket orders first
-                            open_orders = api.list_orders(status="open", symbols=[CONFIG["ticker"]])
-                            for o in open_orders:
-                                api.cancel_order(o.id)
-                        except Exception as e:
-                            log(f"Could not cancel open orders on manual close: {e}", "WARN")
-                        _close_ok = close_all(api)
-                        if not _close_ok:
-                            log(f"close_all() call failed for manual trade {target_trade.get('order_id','')}", "WARN")
-                        _confirmed = False
-                        for _cw in range(10):
-                            time.sleep(1)
-                            try:
-                                if get_position(api) is None:
-                                    _confirmed = True
-                                    break
-                            except Exception:
-                                break
-                        if not _confirmed:
-                            raise ValueError(
-                                "Close submitted but Alpaca has not confirmed the position is gone yet — "
-                                "check Alpaca directly, then retry Confirm Close (bot has not marked this closed)."
-                            )
-                        log(f"Alpaca position closed for manual trade {target_trade.get('order_id','')}", "TRADE")
-
-                    # Use the P&L you typed in the modal when provided (e.g. you closed
-                    # the position yourself and know the real number). Otherwise fall
-                    # back to an estimate from the bot's last cached price.
-                    cur_px = state.get("last_price", target_trade["entry"])
-                    if pnl:
-                        log(f"Using user-provided P&L (${pnl:+.2f}) for manual trade {target_trade.get('order_id','')}", "TRADE")
-                    else:
-                        if target_trade.get("fvg_type") == "bullish":
-                            pnl = round((cur_px - target_trade["entry"]) * target_trade["qty"], 2)
-                        else:
-                            pnl = round((target_trade["entry"] - cur_px) * target_trade["qty"], 2)
-
-                    target_trade["outcome"] = "MANUAL_CLOSE"
-                    target_trade["pnl"]     = pnl
-                    target_trade["exit_px"] = cur_px
-                    _finalize_trade_close(target_trade)
-                    remove_active_trade(target_trade)
-                    if not get_active_trades():
-                        state["traded_today"] = False
-                    state["trades_today"] = state.get("trades_today", 0) + 1
-                    _record_day_trade()
-                    state["daily_pnl"]    = state.get("daily_pnl", 0.0) + pnl
-                    log(f"MANUAL TRADE closed | ID: {target_trade.get('order_id','')} | P&L: ${pnl:+.2f}", "TRADE")
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Access-Control-Allow-Origin', '*')
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"ok": True}).encode())
-                else:
-                    raise ValueError("No matching manual trade to close")
+                close_manual_trade(body.get("order_id", ""), float(body.get("pnl", 0) or 0))
+                self._send_json(200, {"ok": True})
             except Exception as e:
-                self.send_response(400)
-                self.send_header('Content-Type', 'application/json')
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers()
-                self.wfile.write(json.dumps({"ok": False, "error": str(e)}).encode())
+                self._send_json(400, {"ok": False, "error": str(e)})
         else:
             self.send_response(404)
-            self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
 
+    def _send_json(self, code, payload):
+        try:
+            self.send_response(code)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(payload, cls=_SafeEncoder).encode())
+        except (ConnectionAbortedError, BrokenPipeError):
+            pass
+
+
 def start_dashboard_server():
-    port = CONFIG["dashboard_port"]
+    # v4.98: NVDA_BOT_PORT is set by the control panel (which owns 8080 itself
+    # and talks to the bot on 8081). Standalone runs keep the old 8080.
+    port = int(os.environ.get("NVDA_BOT_PORT") or CONFIG["dashboard_port"])
 
     def _run():
         # Auto-restart loop — if the HTTP server crashes (e.g. during a
@@ -3015,8 +3169,8 @@ def start_dashboard_server():
         # the dashboard permanently offline for the rest of the session.
         while True:
             try:
-                server = HTTPServer(('', port), DashboardHandler)
-                log(f"Dashboard server started on port {port}")
+                server = ThreadingHTTPServer((BOT_HTTP_HOST, port), DashboardHandler)
+                log(f"Dashboard server started on {BOT_HTTP_HOST or 'all interfaces'}:{port}")
                 server.serve_forever()
             except OSError as e:
                 # Port already in use — don't retry immediately
@@ -3033,12 +3187,175 @@ def start_dashboard_server():
         time.sleep(0.5)  # give server time to start
         if not thread.is_alive():
             log("Dashboard server thread died on startup — dashboard unavailable", "ERROR")
-        else:
-            print(f"\n  📊 Live dashboard: http://localhost:{port}")
+        elif not os.environ.get("NVDA_BOT_PORT"):   # control panel prints its own URL
+            print(f"\n  📊 Live dashboard: http://127.0.0.1:{port}")
             print(f"  Open that URL in your browser while the bot runs.")
             print(f"  (Using this URL lets manual trades work — don't open the HTML file directly)\n")
     except Exception as e:
         log(f"Dashboard server failed to start: {e}", "ERROR")
+
+# ═══════════════════════════════════════════════════════════════
+# TRADINGVIEW WEBHOOK RECEIVER (v4.98)
+# ═══════════════════════════════════════════════════════════════
+# TradingView alerts (from nvda_strategy.pine, or any alert you write) POST a
+# JSON message here and the bot places the order on Alpaca. Alert message:
+#   {"passphrase": "...", "ticker": "NVDA", "action": "buy" | "sell" | "close",
+#    "strategy": "SPIKE", "stop": 181.20, "target": 184.90, "qty": 0}
+# - "buy"/"long" opens a long, "sell"/"short" opens a short, "close"/"exit"
+#   closes any open TradingView trade.
+# - stop/target are optional: if missing the bot uses stop_atr_mult × ATR and
+#   risk_reward like a dashboard ATR trade.
+# - qty is optional: 0/missing sizes like the bot's own trades
+#   (risk_per_trade of equity / stop distance); always capped by
+#   max_position_pct.
+# TradingView can only reach a public HTTPS URL, so run a tunnel (ngrok or
+# cloudflared) to 127.0.0.1:<tv_port>. The passphrase is the only thing
+# keeping strangers who find that URL from trading — keep it long and secret.
+
+_TV_RECENT = {}          # payload fingerprint -> time, to drop TradingView retries
+_TV_MAX_BODY = 10_000
+
+
+def _tv_parse_direction(action):
+    a = str(action or "").strip().lower()
+    if a in ("buy", "long", "bullish"):
+        return "bullish"
+    if a in ("sell", "short", "bearish"):
+        return "bearish"
+    if a in ("close", "exit", "flat", "close_all"):
+        return "close"
+    return None
+
+
+def _tv_qty(direction, stop, qty_req, use_atr):
+    api, equity = get_alpaca()
+    if api is None or equity <= 0:
+        raise ValueError("Cannot reach Alpaca to size the order")
+    price = float(api.get_latest_trade(CONFIG["ticker"]).price)
+    max_qty = max(1, int(equity * CONFIG["max_position_pct"] / price))
+    if qty_req > 0:
+        return min(qty_req, max_qty)
+    if use_atr:
+        risk = CONFIG["stop_atr_mult"] * (state.get("last_atr") or 0)
+    else:
+        risk = abs(price - stop)
+    if risk <= 0:
+        raise ValueError("No stop distance available to size the order — send qty in the alert")
+    return max(1, min(int(equity * CONFIG["risk_per_trade"] / risk), max_qty))
+
+
+def handle_tradingview_alert(alert):
+    """Validate and execute one TradingView alert. Returns a short result string."""
+    ticker = str(alert.get("ticker", CONFIG["ticker"])).split(":")[-1].upper()
+    if ticker != CONFIG["ticker"]:
+        raise ValueError(f"Alert is for {ticker}, bot trades {CONFIG['ticker']} — ignored")
+    direction = _tv_parse_direction(alert.get("action"))
+    if direction is None:
+        raise ValueError(f"Unknown action {alert.get('action')!r} (use buy, sell or close)")
+    strat = str(alert.get("strategy", "TV"))[:40]
+
+    if direction == "close":
+        tv_trades = [t for t in get_active_trades()
+                     if t.get("strategy") == "MANUAL" and t.get("source") == "tradingview"]
+        if not tv_trades:
+            return "close: no open TradingView trade"
+        for t in tv_trades:
+            close_manual_trade(t.get("order_id", ""), 0.0)
+        return f"closed {len(tv_trades)} TradingView trade(s)"
+
+    if get_active_trades():
+        raise ValueError("A position is already open — TradingView entry skipped "
+                         "(the bot holds one NVDA position at a time)")
+    stop   = float(alert.get("stop") or 0)
+    target = float(alert.get("target") or 0)
+    use_atr = stop <= 0 or target <= 0
+    qty = _tv_qty(direction, stop, int(float(alert.get("qty") or 0)), use_atr)
+    res = open_manual_trade(direction, stop, target, qty, managed=True,
+                            use_atr=use_atr, atr_mult=CONFIG["stop_atr_mult"],
+                            source="tradingview", note=f"TradingView {strat}")
+    return (f"{direction} {qty} @ ${res['entry']:.2f} stop ${res['stop']:.2f} "
+            f"target ${res['target']:.2f} ({strat})")
+
+
+def _tv_process(alert):
+    try:
+        log(f"TradingView alert → {handle_tradingview_alert(alert)}", "TRADE")
+    except Exception as e:
+        log(f"TradingView alert rejected: {e}", "WARN")
+
+
+class TradingViewWebhookHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+    def _reply(self, code, payload):
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(payload).encode())
+        except (ConnectionAbortedError, BrokenPipeError):
+            pass
+
+    def do_GET(self):
+        self._reply(200, {"ok": True, "service": "nvda-autotrader tradingview webhook"})
+
+    def do_POST(self):
+        if self.path.split("?")[0] not in ("/", "/tv_webhook"):
+            self._reply(404, {"ok": False})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            if length <= 0 or length > _TV_MAX_BODY:
+                raise ValueError("bad length")
+            raw = self.rfile.read(length)
+            alert = json.loads(raw.decode("utf-8"))
+            if not isinstance(alert, dict):
+                raise ValueError("not an object")
+        except Exception:
+            self._reply(400, {"ok": False, "error": "Alert message must be a JSON object"})
+            return
+        given = str(alert.get("passphrase", ""))
+        if not TV_WEBHOOK_PASSPHRASE or not hmac.compare_digest(
+                given.encode(), TV_WEBHOOK_PASSPHRASE.encode()):
+            log(f"TradingView webhook: bad passphrase from {self.client_address[0]}", "WARN")
+            self._reply(403, {"ok": False, "error": "bad passphrase"})
+            return
+        # TradingView retries when a reply is slow; drop exact repeats for 30s.
+        now = time.time()
+        for k in [k for k, ts in _TV_RECENT.items() if now - ts > 30]:
+            _TV_RECENT.pop(k, None)
+        fp = hashlib.sha256(raw).hexdigest()
+        if fp in _TV_RECENT:
+            self._reply(200, {"ok": True, "duplicate": True})
+            return
+        _TV_RECENT[fp] = now
+        # Reply right away (TradingView gives up after a few seconds) and
+        # place the order in the background — results go to the bot log.
+        threading.Thread(target=_tv_process, args=(alert,), daemon=True).start()
+        self._reply(200, {"ok": True, "accepted": True})
+
+
+def start_tradingview_webhook():
+    if not TV_WEBHOOK_ENABLED:
+        return
+    host = os.environ.get("NVDA_TV_HOST", "127.0.0.1")
+
+    def _run():
+        while True:
+            try:
+                srv = ThreadingHTTPServer((host, TV_WEBHOOK_PORT), TradingViewWebhookHandler)
+                log(f"TradingView webhook listening on {host}:{TV_WEBHOOK_PORT} "
+                    f"(signal source: {SIGNAL_SOURCE})")
+                srv.serve_forever()
+            except OSError as e:
+                log(f"TradingView webhook could not bind port {TV_WEBHOOK_PORT}: {e}", "ERROR")
+                time.sleep(30)
+            except Exception as e:
+                log(f"TradingView webhook crashed: {e} — restarting in 5s", "WARN")
+                time.sleep(5)
+
+    threading.Thread(target=_run, daemon=True).start()
 
 # ═══════════════════════════════════════════════════════════════
 # DAILY RESET
@@ -7643,17 +7960,16 @@ def _watchdog_loop():
 
 def main():
     print("\n" + "="*55)
-    print("  NVDA DUAL-STRATEGY AUTO TRADER v4.97")
+    print("  NVDA DUAL-STRATEGY AUTO TRADER v4.98")
     print("  Strategies: ALL live — VWAP, FVG, SPIKE(range-extreme+momentum), RANGE, SWING-3M/6M | research mode: small size")
     print("  Alpaca Data + Alpaca Paper Trading")
     print("="*55)
 
-    if not ALPACA_API_KEY:
-        print("\nERROR: Add your Alpaca API key.")
-        return
-    if not ALPACA_SECRET_KEY:
-        print("\nERROR: Add your Alpaca secret key.")
-        return
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        print("\nERROR: No Alpaca API keys set.")
+        print("  Run:  python build_dashboard.py   then open the Settings tab,")
+        print("  paste your keys, click Save, then Start Bot.")
+        sys.exit(2)   # non-zero, but the control panel won't auto-restart on code 2
 
     # ── Auto-archive this version on startup ──────────────────────
     # Saves a timestamped copy to archive\ once per day automatically
@@ -7679,6 +7995,8 @@ def main():
 
     # Start live dashboard server
     start_dashboard_server()
+    start_tradingview_webhook()
+    log(f"Mode: {'PAPER' if IS_PAPER else '*** LIVE MONEY ***'} | Signal source: {SIGNAL_SOURCE}")
 
     log("Connecting to Alpaca...")
     api_result = get_alpaca()
@@ -7704,10 +8022,10 @@ def main():
                 log("Retrying Alpaca connection...")
                 api_result = get_alpaca()
     if api_result[0] is None:
-        print("ERROR: Could not connect to Alpaca. Check your keys.")
-        return
+        print("ERROR: Could not connect to Alpaca. Check your keys in the dashboard Settings tab.")
+        sys.exit(3)
 
-    log(f"Connected — Portfolio: ${api_result[1]:,.2f} | PAPER MODE")
+    log(f"Connected — Portfolio: ${api_result[1]:,.2f} | {'PAPER' if IS_PAPER else '*** LIVE ***'} MODE")
     _refresh_market_clock()  # detect half-days / early closes at session start
 
     # Restore state from previous session if bot restarted today
@@ -7998,7 +8316,12 @@ def main():
                         state["_last_kz_logged"] = cur_kz
                         state["stale_scan_count"] = 0  # reset stale counter on new kill zone
                         log(f"Kill zone {cur_kz} ET open — scanning for setups")
-                    check_for_entry()
+                    # v4.98: "tradingview" = only TradingView alerts open trades
+                    if SIGNAL_SOURCE == "tradingview":
+                        if not get_active_trades():
+                            state["status"] = "Waiting for TradingView alerts"
+                    else:
+                        check_for_entry()
                 else:
                     nxt = get_next_kill_zone()
                     if nxt:

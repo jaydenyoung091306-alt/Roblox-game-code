@@ -1,0 +1,12 @@
+# Holds your Alpaca API keys — never commit
+nvda_settings.json
+nvda_settings.json.tmp
+# Runtime output
+bot_console.log
+bot_console.log.old
+nvda_price_history.json
+nvda_bot_state.json
+nvda_live_dashboard.html
+trade_logs/
+archive/
+__pycache__/
