@@ -75,6 +75,7 @@ bot.save_daily_summary = count({"evening": "summary_saves_evening"})
 bot.check_for_entry = count({"morning": "scans_next_morning"})
 bot.monitor_trade = count({"night": "monitor_calls_night", "morning": "monitor_calls_morning"})
 bot._fetch_alpaca = lambda *a, **k: None
+bot.backfill_price_history = lambda *a, **k: 0    # no network in tests
 bot.fetch_candles = lambda *a, **k: None
 bot.print = lambda *a, **k: None
 

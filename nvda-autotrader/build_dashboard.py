@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NVDA AUTO TRADER v5.03 — bot + control panel + dashboard, one file
+NVDA AUTO TRADER v5.04 — bot + control panel + dashboard, one file
 ===================================================================
 
 CLAUDE AI CONTEXT — READ THIS FIRST IF STARTING A NEW CHAT
@@ -125,6 +125,31 @@ KEY CONFIG (see CONFIG dict below):
   extreme_proximity_mult: 0.5   within 0.5×ATR of extreme to trigger
 
 CHANGELOG:
+  v5.04 — Fixes from the first live day's files (user in Japan, JST):
+             1) The trading day was the computer's LOCAL date everywhere
+                (new-day reset, restart detection, summaries, log names). In
+                Japan the US session (22:30-05:00 JST) crosses local midnight,
+                so reset_daily_state() fired at 11:00 ET mid-session — force-
+                closing open positions, wiping the day's FVGs, P&L and BOD
+                equity — and one session was split across two dated logs.
+                Now trading_date() = the New York date, used throughout.
+             2) master_trade_log.csv held the one 2026-10-09 trade 12 times.
+                save_daily_summary() re-read today's earlier rows and skipped
+                ones it already had by order_id — a column the CSV never had
+                — so every save (every restart, and the pre-v5.03 after-hours
+                watchdog restarts) re-added all of them, losing fields each
+                time. Rows now carry order_id, matching falls back to the
+                trade's own values, and dedupe_trade_log() cleans old copies
+                (keeping the most complete row) on the next save.
+             3) Price history backfill: RANGE and the SPIKE 5-day-extreme
+                trigger read highs/lows from price_history, filled only while
+                the bot runs. On a fresh folder the "5-day low" was the low
+                since startup (that live trade's came from 109 points, ~2 h).
+                Startup now merges Alpaca 5-min closes when the history
+                doesn't reach back 5 days.
+             4) startup_retry_at is New York time (was local: 09:10 JST is
+                after the US session); daily summary header shows VERSION
+                (was hardcoded "v4.52").
   v5.03 — After-hours loop and new-day reset bugs, found while building the
            multi-symbol backtest:
              1) After 16:00 run_bot() entered a nested `while True` that never
@@ -1867,7 +1892,7 @@ CONFIG = {
                                    # hour-plus.
     "post_trade_cooldown_sec":  90,     # v4.24: seconds to wait after close before re-entry (wash-trade prevention)
     "fetch_retries":      3,
-    "startup_retry_at_local": "09:10",  # v4.93: if the initial Alpaca connect fails
+    "startup_retry_at_et": "09:10",     # v5.04: New York time (was startup_retry_at_local)  # v4.93: if the initial Alpaca connect fails
                                          # (e.g. wifi not up yet at Task Scheduler's
                                          # 8:20 AM launch), wait until this LOCAL time
                                          # and try exactly once more instead of giving
@@ -2133,7 +2158,7 @@ def _run_shadow_check(trade, shadow_key, label, csv_name):
         os.makedirs("trade_logs", exist_ok=True)
         path = os.path.join("trade_logs", csv_name)
         row = {
-            "date": str(now_local().date()),
+            "date": str(trading_date()),
             "real_strategy": trade.get("strategy", ""),
             "real_outcome":  trade.get("outcome", ""),
             "real_pnl":      trade.get("pnl", 0),
@@ -2204,6 +2229,16 @@ def now_local():
 
 def now_et():
     return datetime.now(MARKET_TZ)
+
+
+def trading_date():
+    """v5.04: the trading day is the New York calendar date. Everything that
+    means "today" for the bot (new-day reset, restart detection, daily
+    summaries, log file names) uses this, not the computer's local date — in
+    Japan the US session (22:30-05:00 JST) crosses local midnight, so the
+    local date used to split one session in two and fire the new-day reset
+    (which force-closes open positions) at 11:00 ET, mid-session."""
+    return now_et().date()
 
 def et_to_local_str(et_time_str):
     sh, sm   = map(int, et_time_str.split(":"))
@@ -2356,7 +2391,7 @@ def save_state():
     """Save critical trade state to disk so restarts don't lose position info."""
     try:
         os.makedirs("trade_logs", exist_ok=True)
-        today = str(now_local().date())
+        today = str(trading_date())
 
         def _serialize_trade(t):
             if not t:
@@ -2441,7 +2476,7 @@ def _find_open_trade_in_recent_logs(qty, side, lookback_days=5):
     """
     try:
         for _back in range(1, lookback_days + 1):
-            _d = (now_local().date() - timedelta(days=_back))
+            _d = (trading_date() - timedelta(days=_back))
             _path = os.path.join("trade_logs", f"{_d}_trades.csv")
             if not os.path.exists(_path):
                 continue
@@ -2503,7 +2538,7 @@ def load_state():
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 payload = json.load(f)
 
-            today = str(now_local().date())
+            today = str(trading_date())
             # v4.54 fix: record the state file's own saved date regardless of
             # the branch below. reset_daily_state()'s same-day-restart
             # detection used to rely solely on bod_date, which is only set
@@ -2530,7 +2565,7 @@ def load_state():
                 # today" truth as everything else in this branch, closes that
                 # gap for good — reset_daily_state() will now correctly skip
                 # its reset block on a genuine same-day restart.
-                state["last_date"] = now_local().date()
+                state["last_date"] = trading_date()
                 # Restore flags
                 state["traded_today"]       = payload.get("traded_today", False)
                 state["order_failed_today"] = payload.get("order_failed_today", False)
@@ -2676,7 +2711,7 @@ def load_existing_log():
     regardless of how many times the bot was restarted.
     """
     try:
-        today      = now_local().date()
+        today      = trading_date()
         log_dir    = "trade_logs"
         csv_path   = os.path.join(log_dir, f"{today}_trades.csv")
 
@@ -2693,12 +2728,12 @@ def load_existing_log():
             state["session_start_equity"] = float(first_equity)
         # Restore BOD equity on same-day restart so day P&L stays accurate
         # If bod_date matches today, keep the original BOD equity baseline
-        if state.get("bod_date") == str(now_local().date()) and state.get("bod_equity", 0) > 0:
+        if state.get("bod_date") == str(trading_date()) and state.get("bod_equity", 0) > 0:
             pass  # bod_equity already correct — don't overwrite
         else:
             # Different day or no BOD equity — set from current equity
             state["bod_equity"] = float(first_equity)
-            state["bod_date"]   = str(now_local().date())
+            state["bod_date"]   = str(trading_date())
             log(f"LOG RESTORED — session equity from earlier run: ${float(first_equity):,.2f}")
 
         # Restore trade info if a trade was taken earlier today
@@ -3062,11 +3097,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 _days_open = 0
                 if hasattr(_oa, "strftime"):
                     _oa_local = _oa.astimezone(MARKET_TZ) if hasattr(_oa, "astimezone") else _oa
-                    if _oa_local.date() == now_local().date():
+                    if _oa_local.date() == trading_date():
                         _oa_str = _oa_local.strftime("%H:%M %Z")
                     else:
                         _oa_str = _oa_local.strftime("%m/%d %H:%M %Z")
-                        _days_open = (now_local().date() - _oa_local.date()).days
+                        _days_open = (trading_date() - _oa_local.date()).days
                 else:
                     _oa_str = str(_oa) if _oa else ""
                 return {
@@ -3090,7 +3125,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
             payload = {
                 "timestamp":      now_local().strftime("%H:%M:%S %Z"),
-                "date":           str(now_local().date()),
+                "date":           str(trading_date()),
                 "status":         state["status"],
                 "market_open":    is_market_open(),
                 "in_kill_zone":   is_in_kill_zone(),
@@ -3772,7 +3807,7 @@ def claude_stats(records):
 # ═══════════════════════════════════════════════════════════════
 
 def reset_daily_state():
-    today = now_local().date()
+    today = trading_date()
     if state["last_date"] != today:
         state["traded_today"]       = False
         state["trades_today"]       = 0
@@ -7940,8 +7975,33 @@ def monitor_trade():
 # DAILY SUMMARY
 # ═══════════════════════════════════════════════════════════════
 
+def _trade_key(t):
+    """Identity of a trade that survives a CSV round trip (rows written before
+    v5.04 have no order_id). The date isn't part of it — callers compare
+    within one day."""
+    def num(v, nd=2):
+        try:
+            f = float(v)
+            return None if f != f else round(f, nd)        # NaN → None
+        except (TypeError, ValueError):
+            return None
+    return (str(t.get("strategy", "")), num(t.get("entry")), int(num(t.get("qty"), 0) or 0),
+            num(t.get("exit_price", t.get("exit_px"))), num(t.get("pnl")))
+
+
+def dedupe_trade_log(df):
+    """Drop repeated rows of the same trade, keeping the most complete copy."""
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    df["_key"] = [(str(r.get("date")),) + _trade_key(r) for r in df.to_dict("records")]
+    df["_filled"] = (df.notna() & (df.astype(str).apply(lambda c: c.str.strip()) != "")).sum(axis=1)
+    out = df.sort_values("_filled", ascending=False, kind="stable").drop_duplicates("_key").sort_index()
+    return out.drop(columns=["_key", "_filled"])
+
+
 def save_daily_summary():
-    today    = now_local().date()
+    today    = trading_date()
     log_dir  = "trade_logs"
     os.makedirs(log_dir, exist_ok=True)
 
@@ -7977,15 +8037,18 @@ def save_daily_summary():
     # holds every trade closed today, so all of them make it into the log.
     all_today = []
     seen_ids  = set()
+    seen_keys = set()
     for t in state.get("closed_trades_today", []):
         oid = t.get("order_id", "")
         all_today.append(t)
+        seen_keys.add(_trade_key(t))
         if oid:
             seen_ids.add(oid)
     for t in get_active_trades():
         oid = t.get("order_id", "")
         if oid not in seen_ids:
             all_today.append(t)
+            seen_keys.add(_trade_key(t))
             seen_ids.add(oid)
 
     # Pull in trades from earlier sessions today via master CSV
@@ -7994,11 +8057,26 @@ def save_daily_summary():
         try:
             with open(master_path, newline="", encoding="utf-8") as _f:
                 for row in csv.DictReader(_f):
-                    if row.get("date") == str(today) and row.get("order_id") not in seen_ids:
-                        # Reconstruct minimal trade dict from CSV row
+                    # v5.04: rows written before v5.04 have no order_id column, so the
+                    # old order_id check never matched and every save re-added all
+                    # of today's earlier rows (one more copy per save/restart).
+                    # Match on order_id when present, else on the trade's own values.
+                    if row.get("date") != str(today):
+                        continue
+                    if row.get("order_id") and row.get("order_id") in seen_ids:
+                        continue
+                    if _trade_key(row) in seen_keys:
+                        continue
+                    if (row.get("outcome") or "") in ("NO_TRADE", "") or not row.get("entry"):
+                        continue
+                    seen_keys.add(_trade_key(row))
+                    if True:
                         all_today.append({
                             "order_id":   row.get("order_id", ""),
-                            "fvg_type":   row.get("direction", "").lower(),
+                            "fvg_type":   (row.get("fvg_type") or row.get("direction") or "").lower(),
+                            "qqq_dir":    row.get("qqq_dir", ""),
+                            "risk":       (float(row.get("risk_dollars") or 0) / float(row.get("qty") or 1))
+                                          if row.get("qty") else 0,
                             "strategy":   row.get("strategy", "PRIOR"),
                             "entry":      float(row.get("entry", 0) or 0),
                             "exit_px":    float(row.get("exit_price", 0) or 0),
@@ -8013,7 +8091,8 @@ def save_daily_summary():
                             "monthly_trend":  row.get("monthly_trend", ""),
                             "daily_momentum": row.get("daily_momentum", ""),
                             "swing_pos_6m":   row.get("swing_pos_6m", ""),
-                            "fvg":        {},
+                            "fvg":        {"score": row.get("fvg_score", 0), "score_notes": row.get("score_notes", ""),
+                                           "size": row.get("fvg_size", "")},
                         })
                         seen_ids.add(row.get("order_id", ""))
         except Exception as _e:
@@ -8024,7 +8103,7 @@ def save_daily_summary():
     txt_path = os.path.join(log_dir, f"{today}_summary.txt")
     # Always overwrite — this run has the most complete picture of the day
     with open(txt_path, "w", encoding="utf-8") as f:
-        f.write(f"NVDA AUTO TRADER v4.52 — DAILY SUMMARY\n")
+        f.write(f"NVDA AUTO TRADER {VERSION} — DAILY SUMMARY\n")
         f.write(f"Date: {today}\n{'='*50}\n\n")
         f.write(f"ACCOUNT\n")
         f.write(f"  Start equity:  ${start_equity:,.2f}\n")
@@ -8102,6 +8181,7 @@ def save_daily_summary():
         rows.append({
             "date":         today,
             "ticker":       CONFIG["ticker"],
+            "order_id":     t.get("order_id", ""),
             "strategy":     t.get("strategy", "UNKNOWN"),
             "fvg_type":     t.get("fvg_type", ""),
             "trend":        t.get("trend", ""),
@@ -8168,6 +8248,7 @@ def save_daily_summary():
         df_master = pd.read_csv(master_path)
         df_master = df_master[df_master["date"].astype(str) != str(today)]
         df_master = pd.concat([df_master, df_new], ignore_index=True)
+        df_master = dedupe_trade_log(df_master)       # v5.04: also cleans copies left by older versions
     else:
         df_master = df_new
     df_master.to_csv(master_path, index=False)
@@ -8367,6 +8448,56 @@ def _watchdog_loop():
 # MAIN LOOP
 # ═══════════════════════════════════════════════════════════════
 
+def backfill_price_history(days=8, need_days=5):
+    """v5.04: RANGE and the SPIKE 5-day-extreme trigger read their highs/lows
+    from state["price_history"], which is only filled while the bot runs. On a
+    fresh install, a new folder or after lost history, the "5-day low" was
+    really the low since the bot started — a live trade on 2026-10-09 bought a
+    "5d low" computed from 109 points (~2 hours). If the history doesn't reach
+    back need_days, merge in Alpaca 5-min closes for the last `days` days.
+    Existing points win on the same minute. Returns the number of bars added."""
+    hist = state.get("price_history", [])
+    need_from = (now_et() - timedelta(days=need_days)).strftime("%Y-%m-%dT%H:%M")
+    if hist and min(p.get("t", "9") for p in hist) <= need_from:
+        return 0
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        return 0
+    try:
+        start = (now_et() - timedelta(days=days)).astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
+        bars, tok = [], None
+        while True:
+            params = {"timeframe": "5Min", "start": start, "limit": 10000, "feed": "iex", "adjustment": "raw"}
+            if tok:
+                params["page_token"] = tok
+            r = requests.get(f"{ALPACA_DATA_URL}/v2/stocks/{CONFIG['ticker']}/bars", params=params, timeout=20,
+                             headers={"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY})
+            r.raise_for_status()
+            j = r.json()
+            bars += j.get("bars") or []
+            tok = j.get("next_page_token")
+            if not tok:
+                break
+        have = {p.get("t") for p in hist}
+        added = []
+        for b in bars:
+            et = datetime.fromisoformat(b["t"].replace("Z", "+00:00")).astimezone(MARKET_TZ)
+            mins = et.hour * 60 + et.minute
+            px = float(b.get("c") or 0)
+            t = et.strftime("%Y-%m-%dT%H:%M")
+            if 570 <= mins < 960 and 50 < px < 2000 and t not in have:
+                added.append({"t": t, "p": round(px, 2), "kz": "", "trend": "neutral", "mtf": "neutral"})
+        if added:
+            merged = sorted(hist + added, key=lambda p: p.get("t", ""))
+            state["price_history"] = merged[-2000:]
+            log(f"Price history backfilled with {len(added)} 5-min bars from Alpaca "
+                f"(history only reached back to {min(have) if have else 'nothing'})")
+        return len(added)
+    except Exception as e:
+        log(f"Price history backfill failed (5-day range extremes may be incomplete until "
+            f"the bot has run a few days): {e}", "WARN")
+        return 0
+
+
 def run_bot():
     print("\n" + "="*55)
     print(f"  NVDA AUTO TRADER {VERSION}")
@@ -8420,14 +8551,16 @@ def run_bot():
         # until a fixed local time and make exactly one more attempt before
         # actually giving up. Skips the wait if that time has already passed
         # (e.g. running well after 9:10, or the setting is disabled).
-        _retry_at = CONFIG.get("startup_retry_at_local")
+        # v5.04: the retry time is New York time (it was local time, which in
+        # Japan meant waiting until 09:10 JST = 20:10 ET, after the session).
+        _retry_at = CONFIG.get("startup_retry_at_et", CONFIG.get("startup_retry_at_local"))
         if _retry_at:
-            _now_l = now_local()
+            _now_l = now_et()
             _rh, _rm = (int(x) for x in _retry_at.split(":"))
             _retry_dt = _now_l.replace(hour=_rh, minute=_rm, second=0, microsecond=0)
             if _retry_dt > _now_l:
                 _wait_s = (_retry_dt - _now_l).total_seconds()
-                log(f"Could not connect to Alpaca — waiting until {_retry_at} local "
+                log(f"Could not connect to Alpaca — waiting until {_retry_at} ET "
                     f"({_wait_s/60:.0f} min) for one more attempt instead of "
                     f"giving up now", "WARN")
                 time.sleep(_wait_s)
@@ -8467,6 +8600,7 @@ def run_bot():
                 f"({len(seed)} from JSON + {len(current)} from state)")
         except Exception as e:
             log(f"Could not load price history seed: {e}", "WARN")
+    backfill_price_history()
     log(f"Local timezone: {now_local().strftime('%Z')}")
     log(f"Min score to trade: {CONFIG['min_score_to_trade']}/9")
     log(f"FVG size range: ${CONFIG['min_fvg_size']}–${CONFIG['max_fvg_size']}")
@@ -8811,7 +8945,7 @@ import webbrowser
 # CONFIG
 # ═══════════════════════════════════════════════════════════════
 
-VERSION         = "v5.03"
+VERSION         = "v5.04"
 HERE            = os.path.dirname(os.path.abspath(__file__))
 BOT_SCRIPT      = os.path.abspath(__file__)   # Start Bot runs this same file…
 BOT_ARGS        = ["--run-bot"]                # …in bot mode
@@ -9768,7 +9902,7 @@ BODY_HTML = r"""
             <div id="set-msg2"></div>
             <hr style="border:0;border-top:1px solid var(--border);margin:18px 0">
             <p class="t2" style="font-size:13px;margin:0 0 6px"><b>Run automatically every morning</b></p>
-            <p class="muted" style="font-size:12px;margin:0">Point Windows Task Scheduler (8:20 AM) at:</p>
+            <p class="muted" style="font-size:12px;margin:0">The bot stays up across days once started, so this is only a safety net (e.g. after a reboot). Point Windows Task Scheduler at the command below, about an hour before the US open — <b id="open-local">9:30 AM ET</b>:</p>
             <div class="copy-row" style="margin-top:8px"><code id="cmd-auto">python build_dashboard.py --autostart --no-browser</code><button class="btn sm" onclick="copyText('cmd-auto')">Copy</button></div>
           </div>
         </div>
@@ -10345,6 +10479,7 @@ async function loadSettings() {
   srcHint(settings.signal_source);
   $('#set-restart').checked = settings.auto_restart;
   $('#set-file').textContent = settings.settings_file;
+  $('#open-local').textContent = usOpenLocal();
   $('#set-key').placeholder = settings.has_api_key ? settings.api_key_masked + '  (saved)' : 'PK…';
   $('#set-secret').placeholder = settings.has_secret ? '•••••••• (saved)' : 'Paste secret key';
   const ks = $('#set-keystate');
@@ -10361,6 +10496,18 @@ async function loadSettings() {
   cs.className = 'pill ' + (on ? 'ok' : ''); cs.innerHTML = `<span class="dot"></span>${on ? 'On' : 'Off'}`;
   $('#nav-claude').textContent = on ? 'on' : 'off';
   renderTVInfo();
+}
+function usOpenLocal() {
+  // 9:30 AM New York time today, shown in this computer's time zone
+  const now = new Date();
+  const ny = now.toLocaleString('en-US', { timeZone: 'America/New_York', timeZoneName: 'short' });
+  const offH = /EDT/.test(ny) ? 4 : 5;                       // NY is UTC-4 in summer, UTC-5 in winter
+  const p = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' })
+    .formatToParts(now).reduce((o, x) => (o[x.type] = x.value, o), {});
+  const open = new Date(Date.UTC(+p.year, +p.month - 1, +p.day, 9 + offH, 30));
+  const local = open.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return tz === 'America/New_York' ? '9:30 AM ET' : `9:30 AM ET = ${local} your time (${tz})`;
 }
 function srcHint(s) {
   $('#set-src-hint').textContent = {

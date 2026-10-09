@@ -292,6 +292,7 @@ class EndToEndTests(unittest.TestCase):
         import build_dashboard as bot
         os.chdir(cwd)
         cls.bot = bot
+        cls._orig = {k: getattr(bot, k) for k in ("get_alpaca", "is_market_open", "now_et", "save_state", "log")}
         bot.get_alpaca = lambda: (cls.broker, 100_000.0)
         bot.is_market_open = lambda: True
         fixed = datetime.now(ET).replace(hour=10, minute=0)
@@ -313,6 +314,10 @@ class EndToEndTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.srv.shutdown()
+        for k, v in cls._orig.items():               # leave the shared module as we found it
+            setattr(cls.bot, k, v)
+        for t in list(cls.bot.get_active_trades()):
+            cls.bot.remove_active_trade(t)
 
     def setUp(self):
         self.events.clear()
@@ -635,6 +640,126 @@ class MultiSymbolTest(unittest.TestCase):
                          [("AMD", "asis"), ("AMD", "scaled"), ("GLD", "asis"), ("GLD", "scaled"), ("NVDA", "asis")])
         scaled = {x["symbol"]: float(x["scale"]) for x in rows if x["mode"] == "scaled"}
         self.assertTrue(all(v > 0 and v != 1.0 for v in scaled.values()), scaled)
+
+
+class LiveDayFixTests(unittest.TestCase):
+    """v5.04 regressions from the first live day's files (user in Japan)."""
+    @classmethod
+    def setUpClass(cls):
+        cls.bd = load_panel()
+
+    def setUp(self):
+        import backtest
+        self.bt = backtest
+        b = self.bd
+        self.saved = {k: getattr(b, k) for k in ("datetime", "LOCAL_TZ", "get_alpaca", "log", "requests",
+                                                 "close_all", "get_position")}
+        self.saved_state = dict(b.state)
+        b.log = lambda *a, **k: None
+        b.print = lambda *a, **k: None
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(self.bd, k, v)
+        vars(self.bd).pop("print", None)            # back to the builtin
+        self.bd.state.clear()
+        self.bd.state.update(self.saved_state)
+
+    def test_new_day_follows_new_york_not_local_time(self):
+        """Tokyo midnight is 11:00 ET: the reset must not fire mid-session."""
+        b, bt = self.bd, self.bt
+        b.datetime = bt.SimDatetime
+        b.LOCAL_TZ = ZoneInfo("Asia/Tokyo")
+        broker = bt.Broker(100_000, 0.0)
+        broker.px = 180.0
+        b.get_alpaca = lambda: (broker, 100_000.0)
+        closes = []
+        b.close_all = lambda api: closes.append(1) or True
+        bt.Clock.now = datetime(2026, 10, 9, 10, 55, tzinfo=ET)            # 23:55 JST
+        b.state.update(last_date=None, bod_date="", _state_file_date="", active_trades=[], active_trade=None)
+        b.reset_daily_state()
+        self.assertEqual(b.state["last_date"], datetime(2026, 10, 9).date())
+        trade = {"order_id": "x", "strategy": "VWAP", "fvg_type": "bullish", "entry": 180, "qty": 5,
+                 "opened_at": b.datetime(2026, 10, 9, 10, 30, tzinfo=ET)}
+        b.add_active_trade(trade)
+        bt.Clock.now = datetime(2026, 10, 9, 11, 5, tzinfo=ET)             # 00:05 JST next local day
+        b.reset_daily_state()
+        self.assertEqual(closes, [])                                        # no mid-session force-close
+        self.assertEqual(b.get_active_trades(), [trade])
+        self.assertEqual(b.state["last_date"], datetime(2026, 10, 9).date())
+        self.assertEqual(b.trading_date(), datetime(2026, 10, 9).date())
+        bt.Clock.now = datetime(2026, 10, 10, 0, 5, tzinfo=ET)             # real New York new day
+        b.reset_daily_state()
+        self.assertEqual(b.state["last_date"], datetime(2026, 10, 10).date())
+
+    def test_trade_log_has_no_duplicates_across_restarts(self):
+        """The live file had one trade 12 times; repeated saves must keep exactly one."""
+        import csv
+        b = self.bd
+        work = os.path.join(TMP, "dedupe")
+        os.makedirs(os.path.join(work, "trade_logs"), exist_ok=True)
+        cols = ["date", "ticker", "strategy", "fvg_type", "trend", "qqq_dir", "entry", "stop", "target", "qty",
+                "risk_dollars", "outcome", "exit_price", "pnl", "score_notes", "opened_at"]
+        full = ["2026-10-09", "NVDA", "SPIKE", "bullish", "bearish", "bullish", "229.61", "229.16", "230.0", "21",
+                "9.45", "WIN", "229.97", "7.56", "Range extreme LOW", "14:35 EDT"]
+        thin = ["2026-10-09", "NVDA", "SPIKE", "", "bearish", "", "229.61", "229.16", "230.0", "21",
+                "0.0", "WIN", "229.97", "7.56", "", "14:35 EDT"]
+        old = ["2026-10-08", "NVDA", "VWAP", "bearish", "", "", "231.0", "232.0", "229.5", "20",
+               "20.0", "LOSS", "232.0", "-20.0", "earlier day", "10:05 EDT"]
+        with open(os.path.join(work, "trade_logs", "master_trade_log.csv"), "w", newline="") as f:
+            w = csv.writer(f); w.writerow(cols); w.writerow(old); w.writerow(full)
+            for _ in range(11):
+                w.writerow(thin)
+        acct = types.SimpleNamespace(get_account=lambda: types.SimpleNamespace(equity="100007.56",
+                                                                              portfolio_value="100007.56"))
+        b.get_alpaca = lambda: (acct, 100007.56)
+        saved_td = b.trading_date
+        b.trading_date = lambda: datetime(2026, 10, 9).date()
+        t = {"order_id": "6c73", "strategy": "SPIKE", "fvg_type": "bullish", "entry": 229.61, "stop": 229.16,
+             "target": 230.0, "qty": 21, "risk": 0.45, "outcome": "WIN", "exit_px": 229.97, "pnl": 7.56,
+             "opened_at": datetime(2026, 10, 9, 14, 35, tzinfo=ET), "fvg": {"score_notes": "Range extreme LOW"}}
+        b.state.update(closed_trades_today=[t], closed_trade=t, traded_today=True, bod_equity=100000.0,
+                       bod_date="2026-10-09", session_start_equity=100000.0, live_equity=100007.56,
+                       active_trades=[], active_trade=None)
+        cwd = os.getcwd()
+        os.chdir(work)
+        try:
+            for _ in range(3):
+                b.save_daily_summary()
+            with open("trade_logs/master_trade_log.csv", newline="") as f:
+                rows = list(csv.DictReader(f))
+        finally:
+            os.chdir(cwd)
+            b.trading_date = saved_td
+        day = [r for r in rows if r["date"] == "2026-10-09"]
+        self.assertEqual(len(day), 1, day)
+        self.assertEqual((day[0]["fvg_type"], day[0]["order_id"]), ("bullish", "6c73"))   # complete copy kept
+        self.assertEqual(len([r for r in rows if r["date"] == "2026-10-08"]), 1)           # other days untouched
+
+    def test_price_history_backfill(self):
+        b = self.bd
+        b.datetime = self.bt.SimDatetime
+        self.bt.Clock.now = datetime(2026, 10, 9, 22, 0, tzinfo=ET)
+        calls = []
+
+        def fake_get(url, params=None, headers=None, timeout=None):
+            calls.append(params)
+            first = params.get("page_token") is None
+            bars = ([{"t": "2026-10-02T13:30:00Z", "c": 228.5}, {"t": "2026-10-02T12:00:00Z", "c": 228.0}]  # 2nd is pre-market
+                    if first else [{"t": "2026-10-09T19:50:00Z", "c": 230.1}, {"t": "2026-10-09T19:55:00Z", "c": 230.3}])
+            return types.SimpleNamespace(raise_for_status=lambda: None,
+                                         json=lambda: {"bars": bars, "next_page_token": "p2" if first else None})
+        b.requests = types.SimpleNamespace(get=fake_get)
+        b.state["price_history"] = [{"t": "2026-10-09T15:55", "p": 230.0}] * 1 + [{"t": "2026-10-09T14:00", "p": 229.5}]
+        added = b.backfill_price_history()
+        self.assertEqual(added, 2)            # pre-market bar skipped; 15:55 ET already in history (existing wins)
+        ts = [p["t"] for p in b.state["price_history"]]
+        self.assertEqual(ts, sorted(ts))
+        self.assertIn("2026-10-02T09:30", ts)                                # 13:30Z → 09:30 ET
+        self.assertEqual(len(calls), 2)                                      # followed pagination
+        calls.clear()
+        self.assertEqual(b.backfill_price_history(), 0)                      # now reaches back 5 days
+        self.assertEqual(calls, [])
 
 
 class LoaderTests(unittest.TestCase):

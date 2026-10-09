@@ -1,4 +1,4 @@
-# NVDA AutoTrader (v5.03)
+# NVDA AutoTrader (v5.04)
 
 An algorithmic paper-trading bot for NVDA on Alpaca, with a browser control panel and a TradingView port.
 
@@ -47,6 +47,12 @@ python build_dashboard.py --autostart --no-browser
 The panel starts, launches the bot with your saved keys, and restarts it if it crashes (pauses after 5 crashes in 10 minutes). Under the panel the bot stays up across days and weekends: it rolls over to each new day by itself instead of exiting at midnight. If the panel is still running from the day before, the 8:20 launch just exits and the running bot carries on. Open http://127.0.0.1:8080 any time to check on it.
 
 > If an old copy of `nvda_autotrader.py` is still being started somewhere, delete it. The dashboard says *"A bot started outside this panel is running"* when it detects one.
+
+### Outside the US (e.g. Japan)
+
+The bot runs on New York time: kill zones, the trading day, daily summaries and log file names all follow Eastern Time, whatever your computer's clock says. In Japan the US session is **10:30 PM – 5:00 AM JST** while the US is on daylight time (until Nov 1, 2026), and **11:30 PM – 6:00 AM JST** in winter.
+
+Start the dashboard once with **Start Bot** and leave it running; under the dashboard the bot carries on from day to day by itself. If you use Task Scheduler as a backup, schedule it about an hour before the US open in your local time (the Settings tab shows the exact time), not 8:20 AM. Keep the PC from sleeping overnight.
 
 ## What's in the dashboard
 
@@ -152,7 +158,7 @@ How to read it: a strategy with a real edge should make money on most symbols in
 python -m unittest discover -s tests -v
 ```
 
-41 tests, about 1½ minutes, no network and no real orders. They cover the control panel API and security guards, Start/Stop and auto-restart, the real bot booting from the same file, keys reaching the bot, manual trades and every TradingView webhook rule (through a simulated Alpaca account), the Claude reviewer (fake reviewer and a mocked API, never a real call), the bot's real main loop through an evening and night on a simulated clock (watchdog heartbeat, overnight monitoring, midnight behaviour), the multi-symbol runner, the backtester's fill logic and data loaders, and a full backtest replay.
+44 tests, about 1½ minutes, no network and no real orders. They cover the control panel API and security guards, Start/Stop and auto-restart, the real bot booting from the same file, keys reaching the bot, manual trades and every TradingView webhook rule (through a simulated Alpaca account), the Claude reviewer (fake reviewer and a mocked API, never a real call), the bot's real main loop through an evening and night on a simulated clock (watchdog heartbeat, overnight monitoring, midnight behaviour), the multi-symbol runner, the backtester's fill logic and data loaders, and a full backtest replay.
 
 ## Security notes
 
