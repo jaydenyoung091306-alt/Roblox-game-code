@@ -4,6 +4,7 @@ An algorithmic paper-trading bot for NVDA on Alpaca, with a browser control pane
 
 | File | What it is |
 |---|---|
+| `Start NVDA AutoTrader.bat` | **Double-click this to start** (Windows). |
 | `build_dashboard.py` | **Everything in one file:** the trading bot, the control panel and the dashboard. The only file you run. |
 | `nvda_strategy.pine` | TradingView Pine Script version of the strategies (separate because TradingView only runs Pine). |
 | `backtest.py` | Backtester: replays historical bars through the bot's real code. |
@@ -11,6 +12,12 @@ An algorithmic paper-trading bot for NVDA on Alpaca, with a browser control pane
 | `nvda_settings.json` | Created by the Settings tab. Holds your keys, so **never commit or share it** (it's git-ignored). |
 
 ## Quick start
+
+**Windows: double-click `Start NVDA AutoTrader.bat`.** It finds Python, installs the libraries on first run, and opens the dashboard. Keep its black window open while you trade; close it to quit. (Double-clicking `build_dashboard.py` itself just opens it as a text file — that's normal for Python files.)
+
+No Python yet? Install it from https://www.python.org/downloads/ and tick **"Add python.exe to PATH"** on the first installer screen.
+
+Or from a command prompt in this folder:
 
 ```bash
 pip install alpaca-trade-api yfinance pandas numpy requests tzlocal
