@@ -1,5 +1,5 @@
 """
-NVDA DUAL-STRATEGY AUTO TRADER v4.98
+NVDA DUAL-STRATEGY AUTO TRADER v4.99
 ======================================================
 
 CLAUDE AI CONTEXT — READ THIS FIRST IF STARTING A NEW CHAT
@@ -8,17 +8,19 @@ This is a two-file algorithmic paper trading system for NVDA stock.
 The companion file is build_dashboard.py — always keep versions in sync.
 
 FILES (all in the same project folder):
-  nvda_autotrader.py        — This file (current version: v4.98)
-  build_dashboard.py        — Control panel + dashboard UI (v4.98). Starts/stops
+  nvda_autotrader.py        — This file (current version: v4.99)
+  build_dashboard.py        — Control panel + dashboard UI (v4.99). Starts/stops
                               this bot and holds the API keys.
   nvda_strategy.pine        — TradingView Pine Script port of the strategies
+  backtest.py               — Replays history through this file's real code
+  tests/test_all.py         — python -m unittest discover -s tests
   nvda_settings.json        — Keys + settings saved by the control panel
                               (local only — never commit or share it)
   nvda_price_history.json   — Rolling 2000-point price history {"t":ts,"p":price}
   nvda_bot_state.json       — Persisted session state
   trade_logs/               — Daily .txt summaries + master_trade_log.csv
 
-HOW TO RUN (v4.98):
+HOW TO RUN (v4.99):
   Start:   cd %USERPROFILE%\\Downloads\\NVDA && python build_dashboard.py
            → opens http://127.0.0.1:8080. Enter keys in Settings, click Start Bot.
   Headless (Task Scheduler at 8:20 AM): python build_dashboard.py --autostart --no-browser
@@ -102,6 +104,27 @@ KEY CONFIG (see CONFIG dict below):
   extreme_proximity_mult: 0.5   within 0.5×ATR of extreme to trigger
 
 CHANGELOG:
+  v4.99 — Two exit-path bugs found by the new backtester (backtest.py, which
+           replays historical bars through this file's real check_for_entry()
+           / _monitor_bot_trade() against a simulated Alpaca account):
+             1) The FVG time-stop (fvg_time_stop_min / fvg_time_stop_pct)
+                lived inside _monitor_bot_trade()'s "position is already
+                gone" branch, so it never cut a stalled FVG trade that was
+                actually open. It only ran after the bracket stop had filled
+                (78-312 min in, never at 45), logged a fake "FVG TIME-STOP",
+                failed close_all() with "position does not exist", and booked
+                the stop-out as CLOSED at a guessed price. Moved to the open-
+                position path (before the near-target lock), closing through
+                _confirm_and_finalize_close() like the other exits.
+             2) When Alpaca's own bracket leg closed a long (stop or take-
+                profit), the outcome was decided from the last COMPLETED
+                5-min bar's close, which usually hadn't crossed the level the
+                leg filled at — so the trade was logged "CLOSED" instead of
+                WIN/LOSS. 22% of all backtest trades (every long exiting via
+                its bracket) were mislabeled, hiding real wins and losses from
+                the trade-log win rates. The actual fill P&L now decides.
+           Also: control panel closes the bot's stdout pipe on exit (handle
+           leak per restart); Pine QQQ request.security lookahead explicit.
   v4.98 — Control panel, keys out of the code, TradingView, dashboard lockdown:
              1) build_dashboard.py is now the app: `python build_dashboard.py`
                 serves a redesigned dashboard on 127.0.0.1:8080 with Start /
@@ -6769,63 +6792,13 @@ def _monitor_bot_trade(trade, api):
             pass
 
         # ── FVG time-stop ────────────────────────────────────────────────────
-        # Close FVG trades that haven't reached 70% of target after 45 minutes.
-        # Captures partial profit rather than risking full reversal to stop.
-        _trade_strategy = trade.get("strategy", "UNKNOWN")
-        if _trade_strategy == "FVG" and CONFIG.get("fvg_time_stop_min"):
-            _opened = trade.get("opened_at")
-            if _opened:
-                _mins_open = (now_local() - _opened).total_seconds() / 60
-                if _mins_open >= CONFIG["fvg_time_stop_min"]:
-                    _pos_ts = get_position(api)
-                    _cur_ts = float(_pos_ts.current_price) if _pos_ts else state.get("last_price", trade["entry"])
-                    _full_move = abs(trade["target"] - trade["entry"])
-                    if _full_move > 0:
-                        if fvg_type == "bullish":
-                            _progress = (_cur_ts - trade["entry"]) / _full_move
-                        else:
-                            _progress = (trade["entry"] - _cur_ts) / _full_move
-                        _pct_needed = CONFIG.get("fvg_time_stop_pct", 0.70)
-                        if _progress < _pct_needed:
-                            log(f"FVG TIME-STOP — {_mins_open:.0f} min open, "
-                                f"progress {_progress:.0%} < {_pct_needed:.0%} — "
-                                f"closing to capture partial profit", "TRADE")
-                            _ts_pnl = (_cur_ts - trade["entry"]) * trade["qty"] if fvg_type == "bullish"                                       else (trade["entry"] - _cur_ts) * trade["qty"]
-                            _ts_close_ok = close_all(api)
-                            if not _ts_close_ok:
-                                log("FVG time-stop: close_all() call failed (API error) — will retry next scan cycle", "WARN")
-                            _confirmed = False
-                            for _w in range(20):
-                                time.sleep(1)
-                                try:
-                                    if get_position(api) is None:
-                                        _confirmed = True; break
-                                except Exception:
-                                    break
-                            # v4.52 fix: previously fell through and marked the trade
-                            # closed even when Alpaca never confirmed the close, causing
-                            # the same state-desync as the EOD bug (daily_pnl/active_trades
-                            # said "closed" while the real position stayed open). Now only
-                            # book it closed on confirmation; otherwise retry next cycle.
-                            if not _confirmed:
-                                _ts_retry_count = trade.get("_ts_retry_count", 0) + 1
-                                trade["_ts_retry_count"] = _ts_retry_count
-                                state["status"] = f"FVG time-stop close unconfirmed (attempt {_ts_retry_count}) — retrying"
-                                save_state()
-                                if _ts_retry_count >= 8:
-                                    log(f"FVG TIME-STOP CLOSE STILL UNCONFIRMED after {_ts_retry_count} attempts — "
-                                        f"CHECK ALPACA MANUALLY, bot will keep retrying", "ERROR")
-                                return False
-                            remove_active_trade(trade)
-                            trade["outcome"] = "CLOSED"
-                            trade["exit_px"] = round(_cur_ts, 2)
-                            trade["pnl"]     = round(_ts_pnl, 2)
-                            _finalize_trade_close(trade)
-                            state["daily_pnl"]    = state.get("daily_pnl", 0.0) + round(_ts_pnl, 2)
-                            state["trades_today"] = state.get("trades_today", 0) + 1
-                            _record_day_trade()
-                            save_state()
-                            return True
+        # v4.99: the FVG time-stop used to live here — inside the "position
+        # is already gone" branch — so it never cut a stalled trade that was
+        # actually open; it only fired after the bracket stop had filled,
+        # logged a fake TIME-STOP, failed close_all() ("position does not
+        # exist") and booked the stop-out as CLOSED at a guessed price.
+        # Found by backtest. It now runs on the open position (see below,
+        # before the near-target lock).
 
         df = fetch_candles(CONFIG["ticker"], bars=10)
         if df is not None:
@@ -6909,7 +6882,14 @@ def _monitor_bot_trade(trade, api):
             else:
                 pnl = (trade["entry"] - exit_px) * trade["qty"]
             # Override outcome based on actual P&L (fill may differ from signal)
-            if outcome in ("WIN", "LOSS"):
+            # v4.99: "CLOSED" included — this path runs when Alpaca's own
+            # bracket leg (stop or take-profit) closed the position, and the
+            # label above comes from the last COMPLETED 5-min bar's close,
+            # which usually hasn't crossed the stop/target the leg filled at.
+            # Backtest found 22% of all trades (every long exiting via its
+            # bracket leg) were being logged "CLOSED", hiding real wins and
+            # losses from the trade-log win rates. The actual fill decides.
+            if outcome in ("WIN", "LOSS", "CLOSED"):
                 outcome = "WIN" if pnl > 0 else "LOSS"
 
             duration = int((now_local() - trade["opened_at"]).total_seconds() / 60)
@@ -7025,6 +7005,26 @@ def _monitor_bot_trade(trade, api):
     # tight-target strategies can sit most of the way to target for a long
     # time without the R-multiple trail ever engaging. Once open long enough
     # and mostly there, bank it instead of gambling on the last few cents.
+    # ── FVG time-stop (v4.99: moved here from the position-gone branch) ──
+    # A stalled FVG trade that hasn't covered fvg_time_stop_pct of the move
+    # to target after fvg_time_stop_min minutes is closed at market.
+    if trade.get("strategy") == "FVG" and CONFIG.get("fvg_time_stop_min"):
+        _ts_opened = trade.get("opened_at")
+        if _ts_opened:
+            _mins_open = (now_local() - _ts_opened).total_seconds() / 60
+            _full_move = abs(trade["target"] - trade["entry"])
+            if _mins_open >= CONFIG["fvg_time_stop_min"] and _full_move > 0:
+                _progress = ((cur_px - trade["entry"]) / _full_move if fvg_type == "bullish"
+                             else (trade["entry"] - cur_px) / _full_move)
+                _pct_needed = CONFIG.get("fvg_time_stop_pct", 0.70)
+                if _progress < _pct_needed:
+                    log(f"FVG TIME-STOP — {_mins_open:.0f} min open, "
+                        f"progress {_progress:.0%} < {_pct_needed:.0%} — closing stalled trade", "TRADE")
+                    _ts_pnl = ((cur_px - trade["entry"]) * trade["qty"] if fvg_type == "bullish"
+                               else (trade["entry"] - cur_px) * trade["qty"])
+                    return _confirm_and_finalize_close(api, trade, "CLOSED", cur_px, _ts_pnl,
+                                                       "FVG TIME-STOP", max_wait=20)
+
     if CONFIG.get("near_target_lock_min"):
         _ntl_opened = trade.get("opened_at")
         if _ntl_opened:
@@ -7960,7 +7960,7 @@ def _watchdog_loop():
 
 def main():
     print("\n" + "="*55)
-    print("  NVDA DUAL-STRATEGY AUTO TRADER v4.98")
+    print("  NVDA DUAL-STRATEGY AUTO TRADER v4.99")
     print("  Strategies: ALL live — VWAP, FVG, SPIKE(range-extreme+momentum), RANGE, SWING-3M/6M | research mode: small size")
     print("  Alpaca Data + Alpaca Paper Trading")
     print("="*55)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NVDA AutoTrader — Control Panel & Dashboard v4.98
+NVDA AutoTrader — Control Panel & Dashboard v4.99
 ==================================================
 
 CLAUDE AI CONTEXT — READ THIS FIRST IF STARTING A NEW CHAT
@@ -12,6 +12,7 @@ FILES (all live in the same project folder):
   build_dashboard.py        — This file. Control panel server + dashboard UI.
   nvda_autotrader.py        — The trading bot. Started/stopped by this file.
   nvda_strategy.pine        — TradingView Pine Script port of the strategies.
+  backtest.py               — Backtester (replays history through the bot's code).
   nvda_settings.json        — Saved keys + settings (written by the Settings tab;
                               local only, never commit or share it).
   nvda_price_history.json   — Rolling 2000-point price history (written by the bot)
@@ -78,7 +79,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # CONFIG
 # ═══════════════════════════════════════════════════════════════
 
-VERSION         = "v4.98"
+VERSION         = "v4.99"
 HERE            = os.path.dirname(os.path.abspath(__file__))
 BOT_SCRIPT      = os.path.join(HERE, "nvda_autotrader.py")
 SETTINGS_FILE   = os.path.join(HERE, "nvda_settings.json")
@@ -319,6 +320,7 @@ class BotProcess:
     def _pump(self, proc):
         for line in proc.stdout:
             self._add(line.rstrip("\r\n"))
+        proc.stdout.close()
         rc = proc.wait()
         self._on_exit(proc, rc)
 

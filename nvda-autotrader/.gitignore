@@ -10,3 +10,4 @@ nvda_live_dashboard.html
 trade_logs/
 archive/
 __pycache__/
+backtest_results/

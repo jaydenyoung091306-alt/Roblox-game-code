@@ -1,4 +1,4 @@
-# NVDA AutoTrader (v4.98)
+# NVDA AutoTrader (v4.99)
 
 An algorithmic paper-trading bot for NVDA on Alpaca, with a browser control panel and a TradingView port.
 
@@ -7,6 +7,8 @@ An algorithmic paper-trading bot for NVDA on Alpaca, with a browser control pane
 | `build_dashboard.py` | **The app.** Control panel + dashboard. Starts/stops the bot and holds your keys. |
 | `nvda_autotrader.py` | The trading bot (strategies, orders, exits). The panel runs it for you. |
 | `nvda_strategy.pine` | TradingView Pine Script version of the strategies. |
+| `backtest.py` | Backtester: replays historical bars through the bot's real code. |
+| `tests/` | Automated tests (no network, no real orders). |
 | `nvda_settings.json` | Created by the Settings tab. Holds your keys, so **never commit or share it** (it's git-ignored). |
 
 ## Quick start
@@ -62,7 +64,7 @@ Ported: SPIKE momentum, SPIKE 5-day extreme, VWAP bounce, FVG retrace, SWING-6M 
 2. Settings → *Where trades come from* → **TradingView alerts** (or **Both**) → **Restart now**.
 3. Expose the receiver: `ngrok http 8090` (or `cloudflared tunnel --url http://127.0.0.1:8090`). TradingView only calls public HTTPS URLs.
 4. In the Pine script's inputs, paste the same passphrase.
-5. Create Alert → Condition: *NVDA AutoTrader v4.98* → **Order fills only** → Webhook URL `https://<your-tunnel>/tv_webhook` → Message `{{strategy.order.alert_message}}`.
+5. Create Alert → Condition: *NVDA AutoTrader v4.99* → **Order fills only** → Webhook URL `https://<your-tunnel>/tv_webhook` → Message `{{strategy.order.alert_message}}`.
 
 Every alert goes through the same checks as a dashboard trade: market hours, a fresh live price, stop/target on the correct sides of it, and size capped at `max_position_pct`. The bot holds one NVDA position at a time, so an entry alert is skipped while anything is open. Exact repeats within 30 s (TradingView retries) are dropped. Results show in the Console.
 
@@ -73,6 +75,31 @@ Alert JSON, if you write your own alerts:
 ```
 
 `action` is `buy`, `sell` or `close`. `stop`/`target` are optional (default: 2×ATR stop, 1.5R target). `qty` 0 lets the bot size it from your equity.
+
+## Backtesting
+
+`backtest.py` replays historical 5-minute bars through the bot's **actual code**. The real `check_for_entry()`, `_place_trade()` and exit monitor run unchanged. Only the clock, the data feed and Alpaca are simulated. So the results include the bot's breakeven lock, trailing stop, FVG time stop, near-target lock, EOD close and SWING-6M overnight holds, exactly as coded.
+
+```bash
+python backtest.py --source alpaca --start 2026-04-01 --end 2026-09-30   # uses your saved keys, IEX feed (what the bot trades on)
+python backtest.py --source yfinance                                     # last ~55 days, no keys needed
+python backtest.py --source csv --csv nvda_5m.csv --qqq-csv qqq_5m.csv
+python backtest.py --source alpaca --set '{"risk_reward": 2.0}'          # try a CONFIG change
+```
+
+It prints per-strategy stats (trades, win %, total and average $, average R, profit factor), net P&L, max drawdown and exit routes. It writes `backtest_results/trades.csv`, `equity.csv` and `summary.txt`. Every run also checks itself: P&L reconciles with the simulated broker, every bot trade matches a broker fill, entries happen only in kill zones, only SWING-6M is held overnight, position size stays within the cap, and only one position is open at a time. The backtest never touches your real `trade_logs/` or price history.
+
+How exits are simulated: the bot polls every 15 s, so each 5-minute bar is replayed as 20 ticks along open → low → high → close (open → high → low → close on red bars). Market orders fill at the tick ± `--slippage` (default $0.01/share), and stops fill at the stop price unless price gapped through it. The real path inside a bar is unknown, so exits that depend on it are estimates.
+
+`--source synthetic` runs on made-up random prices. It only proves the machinery works; its numbers mean nothing.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+28 tests, about 50 s, no network and no real orders. They cover the control panel API and security guards, Start/Stop and auto-restart, keys reaching the bot, manual trades and every TradingView webhook rule (through a simulated Alpaca account), the backtester's fill logic and data loaders, and a full backtest replay.
 
 ## Security notes
 
