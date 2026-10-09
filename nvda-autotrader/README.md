@@ -1,4 +1,4 @@
-# NVDA AutoTrader (v5.00)
+# NVDA AutoTrader (v5.01)
 
 An algorithmic paper-trading bot for NVDA on Alpaca, with a browser control panel and a TradingView port.
 
@@ -20,7 +20,7 @@ No Python yet? Install it from https://www.python.org/downloads/ and tick **"Add
 Or from a command prompt in this folder:
 
 ```bash
-python -m pip install --only-binary=:all: yfinance pandas numpy requests tzlocal msgpack websockets websocket-client aiohttp pyyaml deprecation python-dateutil
+python -m pip install --only-binary=:all: yfinance pandas numpy requests tzlocal msgpack websockets websocket-client aiohttp pyyaml deprecation python-dateutil anthropic
 python -m pip install --no-deps alpaca-trade-api==3.2.0
 python build_dashboard.py
 ```
@@ -87,6 +87,25 @@ Alert JSON, if you write your own alerts:
 
 `action` is `buy`, `sell` or `close`. `stop`/`target` are optional (default: 2×ATR stop, 1.5R target). `qty` 0 lets the bot size it from your equity.
 
+## Claude second opinion
+
+The **Claude** tab lets Claude (Anthropic's AI model, `claude-opus-5-5`) review every trade the bot takes, so you can see whether its judgment beats the bot's rules.
+
+1. Get an API key at [console.anthropic.com](https://console.anthropic.com) → API Keys. It's billed per use: roughly $0.05–0.10 per review, and capped at 40 reviews a day.
+2. In the **Claude** tab: paste the key, click **Test**, tick **Review every bot trade with Claude**, then **Save**.
+3. Restart the bot.
+
+**How it works (shadow mode):** when the bot enters a trade, it sends Claude what it knew at that moment: the setup and its reason, entry/stop/target, trend, QQQ, VWAP, ATR, multi-month ranges, and today's 5-minute bars. Claude answers **TAKE** or **SKIP** with a confidence from 1 to 5 and a short reason. This happens in the background. The bot still places every trade itself, and Claude never places, blocks or changes an order.
+
+When each trade closes, its real result is stored next to Claude's verdict (`trade_logs/claude_reviews.json`). The tab then compares three groups:
+- **Bot alone**: every trade.
+- **Bot + Claude**: only the trades Claude approved.
+- **Trades Claude would skip**: if these lose money, Claude is adding value.
+
+All three are real fills, not simulations. Each trade card also shows Claude's verdict, and you can hover over it for the reason.
+
+**Reading the results:** give it 30–50+ closed trades before trusting the comparison; with a handful of trades, luck dominates. Claude can't be backtested honestly because it has seen historical prices during training, so live paper trading is the real test, and backtests always run with it off. If Claude clearly adds value over a large sample, the next step would be a "veto" mode where the bot skips trades Claude rejects.
+
 ## Backtesting
 
 `backtest.py` replays historical 5-minute bars through the bot's **actual code**. The real `check_for_entry()`, `_place_trade()` and exit monitor run unchanged. Only the clock, the data feed and Alpaca are simulated. So the results include the bot's breakeven lock, trailing stop, FVG time stop, near-target lock, EOD close and SWING-6M overnight holds, exactly as coded.
@@ -110,7 +129,7 @@ How exits are simulated: the bot polls every 15 s, so each 5-minute bar is repla
 python -m unittest discover -s tests -v
 ```
 
-29 tests, about 50 s, no network and no real orders. They cover the control panel API and security guards, Start/Stop and auto-restart, the real bot booting from the same file, keys reaching the bot, manual trades and every TradingView webhook rule (through a simulated Alpaca account), the backtester's fill logic and data loaders, and a full backtest replay.
+37 tests, about a minute, no network and no real orders. They cover the control panel API and security guards, Start/Stop and auto-restart, the real bot booting from the same file, keys reaching the bot, manual trades and every TradingView webhook rule (through a simulated Alpaca account), the Claude reviewer (fake reviewer and a mocked API, never a real call), the backtester's fill logic and data loaders, and a full backtest replay.
 
 ## Security notes
 

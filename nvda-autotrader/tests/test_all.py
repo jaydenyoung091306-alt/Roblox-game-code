@@ -17,6 +17,7 @@ Covers:
                     all consistency checks must PASS
 """
 
+import importlib.util
 import json
 import os
 import socket
@@ -54,6 +55,7 @@ os.environ.update({
     "NVDA_BOT_HOST": "127.0.0.1", "NVDA_BOT_PORT": str(BOT_PORT),
     "NVDA_TV_ENABLED": "1", "NVDA_TV_PASSPHRASE": PASS, "NVDA_TV_PORT": str(TV_PORT),
     "NVDA_SIGNAL_SOURCE": "both",
+    "NVDA_CLAUDE_ENABLED": "0", "ANTHROPIC_API_KEY": "",     # tests never call the real Claude API
 })
 
 
@@ -92,7 +94,8 @@ STUB_MODE = os.path.join(TMP, "stub_mode.txt")
 with open(STUB, "w") as f:
     f.write(f'''import os, sys, time
 print("stub bot started key=" + os.environ.get("ALPACA_API_KEY", "MISSING")
-      + " url=" + os.environ.get("ALPACA_BASE_URL", "") + " src=" + os.environ.get("NVDA_SIGNAL_SOURCE", ""), flush=True)
+      + " url=" + os.environ.get("ALPACA_BASE_URL", "") + " src=" + os.environ.get("NVDA_SIGNAL_SOURCE", "")
+      + " claude=" + os.environ.get("NVDA_CLAUDE_ENABLED", "") + " akey=" + os.environ.get("ANTHROPIC_API_KEY", ""), flush=True)
 mode = open({STUB_MODE!r}).read().strip()
 if mode == "run":
     while True:
@@ -108,6 +111,7 @@ def load_panel():
     bd.CONSOLE_LOG = os.path.join(TMP, "bot_console.log")
     bd.BOT_SCRIPT = STUB
     bd.BOT_ARGS = []
+    bd.HERE = TMP
     return bd
 
 
@@ -207,7 +211,7 @@ class BotProcessTests(unittest.TestCase):
 
     def setUp(self):
         self.bd.save_settings(dict(self.bd.DEFAULT_SETTINGS, alpaca_api_key="PKSTUBKEY", alpaca_secret_key="s",
-                                   signal_source="both"))
+                                   signal_source="both", claude_enabled=True, anthropic_api_key="sk-ant-stubkey"))
         self.bp = self.bd.BotProcess()
 
     def tearDown(self):
@@ -225,6 +229,7 @@ class BotProcessTests(unittest.TestCase):
         self.assertIn("key=PKSTUBKEY", line)
         self.assertIn("url=https://paper-api.alpaca.markets", line)
         self.assertIn("src=both", line)
+        self.assertIn("claude=1 akey=sk-ant-stubkey", line)             # Claude settings reach the bot
         self.assertTrue(self.bp.status()["running"])
         self.bp.stop()
         self.assertFalse(self.bp.status()["running"])
@@ -435,6 +440,149 @@ class BrokerSimTests(unittest.TestCase):
         self.assertAlmostEqual(max(p), 12)
         self.assertEqual(p[-1], 11)
         self.assertLess(p.index(min(p)), p.index(max(p)))
+
+
+class ClaudeTests(unittest.TestCase):
+    """Claude second opinion — all offline: fake reviewer or a mocked HTTP layer, never a real API call."""
+    @classmethod
+    def setUpClass(cls):
+        cls.bd = load_panel()
+
+    def setUp(self):
+        self.path = os.path.join(TMP, "trade_logs", "claude_reviews.json")
+        if os.path.exists(self.path):
+            os.remove(self.path)
+        self.saved = (self.bd.CLAUDE_REVIEWS_FILE, self.bd.CLAUDE_ENABLED, self.bd.claude_review, self.bd.log)
+        self.bd.CLAUDE_REVIEWS_FILE = self.path
+        self.bd.CLAUDE_ENABLED = True
+        self.bd.log = lambda *a, **k: None
+
+    def tearDown(self):
+        (self.bd.CLAUDE_REVIEWS_FILE, self.bd.CLAUDE_ENABLED, self.bd.claude_review, self.bd.log) = self.saved
+        self.bd._claude_auth_failed = False
+
+    def snapshot(self):
+        import pandas as pd
+        idx = pd.date_range("2026-10-08 09:30", periods=12, freq="5min", tz="America/New_York")
+        df = pd.DataFrame({"Open": 180.0, "High": 180.5, "Low": 179.6, "Close": 180.2, "Volume": 1000}, index=idx)
+        best = {"direction": "bearish", "entry": 180.2, "stop": 181.0, "target": 179.0, "risk": 0.8, "reason": "spike"}
+        return self.bd.build_claude_snapshot("SPIKE", best, [(1.5, "SPIKE", best), (1.2, "VWAP", {"direction": "bullish"})],
+                                             df, "bullish", "neutral")
+
+    def test_snapshot_contents(self):
+        s = self.snapshot()
+        self.assertEqual(s["setup"]["direction"], "short")
+        self.assertEqual(s["setup"]["reward_to_risk"], 1.5)
+        self.assertEqual(s["context"]["other_signals_this_scan"], [{"strategy": "VWAP", "direction": "bullish", "reward_to_risk": 1.2}])
+        self.assertEqual(s["bars_5m_today"].count("\n"), 12)            # header + 12 bars
+
+    def test_review_then_outcome_is_recorded(self):
+        self.bd.claude_review = lambda snap, client=None: {"decision": "skip", "confidence": 4, "reason": "weak",
+                                                           "key_risks": [], "model": "fake", "latency_s": 0,
+                                                           "input_tokens": 1, "output_tokens": 1, "cost_usd": 0.05}
+        trade = {"order_id": "o-1", "qty": 10, "entry": 180.2, "stop": 181.0}
+        self.bd.start_claude_review(trade, self.snapshot())
+        self.assertTrue(wait_for(lambda: trade["claude"].get("status") == "done", 5))
+        self.assertEqual(trade["claude"]["decision"], "skip")
+        trade.update(outcome="LOSS", pnl=-8.0, exit_px=181.0, orig_stop=181.0)
+        self.bd.claude_record_outcome(trade)
+        rec = self.bd.claude_reviews_load(self.path)[0]
+        self.assertEqual((rec["decision"], rec["pnl"], rec["r_multiple"]), ("skip", -8.0, -1.0))
+
+    def test_failed_review_never_raises(self):
+        def boom(snap, client=None):
+            raise RuntimeError("Claude declined to review (category: None)")
+        self.bd.claude_review = boom
+        trade = {"order_id": "o-2", "qty": 1}
+        self.bd.start_claude_review(trade, self.snapshot())
+        self.assertTrue(wait_for(lambda: trade["claude"].get("status") == "error", 5))
+        self.assertEqual(self.bd.claude_reviews_load(self.path)[0]["status"], "error")
+
+    def test_disabled_does_nothing(self):
+        self.bd.CLAUDE_ENABLED = False
+        trade = {"order_id": "o-3"}
+        self.bd.start_claude_review(trade, self.snapshot())
+        self.assertNotIn("claude", trade)
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_scoreboard_math(self):
+        recs = [dict(status="done", decision=d, confidence=c, pnl=p, outcome="X", r_multiple=r)
+                for d, c, p, r in [("take", 5, 20, 1.0), ("take", 3, -10, -1.0), ("skip", 4, -10, -1.0), ("skip", 2, 15, 0.8)]]
+        recs.append(dict(status="pending"))
+        st = self.bd.claude_stats(recs)
+        self.assertEqual(st["bot_alone"]["pnl"], 15)
+        self.assertEqual(st["with_claude"]["pnl"], 10)
+        self.assertEqual(st["claude_skipped"]["pnl"], 5)
+        self.assertEqual(st["claude_accuracy"], 50.0)                    # right on #1 and #3
+        self.assertEqual(st["high_confidence_takes"]["trades"], 1)
+        self.assertEqual(st["pending"], 1)
+        self.assertIn("Too early", st["verdict"])
+
+    @unittest.skipUnless(importlib.util.find_spec("anthropic") and importlib.util.find_spec("httpx2"),
+                         "anthropic SDK not installed")
+    def test_request_shape_with_real_sdk(self):
+        import anthropic, httpx2
+        seen = {}
+
+        def handler(req):
+            seen["beta"] = req.headers.get("anthropic-beta")
+            seen["body"] = json.loads(req.content)
+            return httpx2.Response(200, json={
+                "id": "m", "type": "message", "role": "assistant", "model": "claude-opus-5-5",
+                "content": [{"type": "text", "text": json.dumps({"decision": "take", "confidence": 2,
+                                                                 "reason": "ok", "key_risks": []})}],
+                "stop_reason": "end_turn", "stop_sequence": None, "usage": {"input_tokens": 1000, "output_tokens": 500}})
+        client = anthropic.Anthropic(api_key="sk-ant-test", http_client=httpx2.Client(transport=httpx2.MockTransport(handler)))
+        v = self.saved[2](self.snapshot(), client=client)                 # the real claude_review
+        b = seen["body"]
+        self.assertEqual(b["model"], "claude-opus-5-5")
+        self.assertEqual(b["fallbacks"], "default")
+        self.assertIn("server-side-fallback-2026-07-01", seen["beta"])
+        self.assertEqual(b["output_config"]["format"]["type"], "json_schema")
+        self.assertEqual(b["output_config"]["effort"], "high")
+        self.assertNotIn("thinking", b)
+        self.assertEqual((v["decision"], v["cost_usd"]), ("take", 0.014))
+
+    def test_panel_claude_settings_and_stats(self):
+        srv = self.bd.ThreadingHTTPServer(("127.0.0.1", 0), self.bd.PanelHandler)
+        url = f"http://127.0.0.1:{srv.server_address[1]}"
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            self.bd.save_settings(dict(self.bd.DEFAULT_SETTINGS))
+            self.assertIn("Enter your Anthropic API key", http(url + "/api/test_claude", {})[1]["error"])
+            self.assertEqual(http(url + "/api/settings", {"claude_enabled": True})[0], 400)       # no key yet
+            self.assertEqual(http(url + "/api/settings", {"anthropic_api_key": "not-a-key"})[0], 400)
+            code, r = http(url + "/api/settings", {"anthropic_api_key": "sk-ant-secretvalue123", "claude_enabled": True})
+            self.assertEqual(code, 200, r)
+            pub = http(url + "/api/settings")[1]
+            self.assertTrue(pub["claude_enabled"])
+            self.assertNotIn("secretvalue", json.dumps(pub))
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            with open(self.path, "w") as f:
+                json.dump([dict(order_id="a", status="done", decision="take", confidence=4, pnl=12.5, outcome="WIN",
+                                r_multiple=1.2, cost_usd=0.06, strategy="VWAP", side="long", entry=180)], f)
+            code, r = http(url + "/api/claude/stats")
+            self.assertEqual(code, 200)
+            self.assertEqual(r["stats"]["with_claude"]["pnl"], 12.5)
+            self.assertEqual(r["recent"][0]["strategy"], "VWAP")
+            code, r = http(url + "/api/settings", {"clear_anthropic_key": True})
+            self.assertFalse(r["settings"]["claude_enabled"])
+        finally:
+            srv.shutdown()
+
+    def test_claude_through_real_trading_code(self):
+        """Replay bars through check_for_entry/_place_trade/exits with a fake reviewer:
+        every bot trade must get a review, and every review its real outcome."""
+        out = os.path.join(TMP, "bt_claude")
+        r = subprocess.run([sys.executable, os.path.join(HERE, "tests", "claude_e2e_helper.py"), HERE, out],
+                           capture_output=True, text=True, timeout=900, cwd=TMP)
+        self.assertEqual(r.returncode, 0, r.stderr[-3000:])
+        first = r.stdout.splitlines()
+        line = next(l for l in first if l.startswith("bot trades closed"))
+        n = [int(x) for x in __import__("re").findall(r"\d+", line)]
+        self.assertTrue(n[0] > 0 and n[0] == n[1] == n[2], line)
+        self.assertIn("errors: 0", r.stdout)
+        self.assertIn("pnl matches the bot's own trade record: True", r.stdout)
 
 
 class LoaderTests(unittest.TestCase):

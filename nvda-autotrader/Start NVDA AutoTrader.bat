@@ -24,11 +24,11 @@ rem alpaca-trade-api pins old msgpack/PyYAML versions that have no prebuilt
 rem download for current Python ("failed building wheel"), so its helpers are
 rem installed as prebuilt current versions and alpaca-trade-api itself with
 rem --no-deps. Tested: all bot tests pass with this set.
-%PY% -c "import alpaca_trade_api, yfinance, pandas, numpy, requests, tzlocal" >nul 2>nul
+%PY% -c "import alpaca_trade_api, yfinance, pandas, numpy, requests, tzlocal, anthropic" >nul 2>nul
 if errorlevel 1 (
     echo Installing required libraries - first run only, takes a minute...
     %PY% -m pip install --upgrade pip
-    %PY% -m pip install --only-binary=:all: yfinance pandas numpy requests tzlocal msgpack websockets websocket-client aiohttp pyyaml deprecation python-dateutil
+    %PY% -m pip install --only-binary=:all: yfinance pandas numpy requests tzlocal msgpack websockets websocket-client aiohttp pyyaml deprecation python-dateutil anthropic
     if errorlevel 1 goto :installfail
     %PY% -m pip install --no-deps alpaca-trade-api==3.2.0
     if errorlevel 1 goto :installfail

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NVDA AUTO TRADER v5.00 — bot + control panel + dashboard, one file
+NVDA AUTO TRADER v5.01 — bot + control panel + dashboard, one file
 ===================================================================
 
 CLAUDE AI CONTEXT — READ THIS FIRST IF STARTING A NEW CHAT
@@ -125,6 +125,22 @@ KEY CONFIG (see CONFIG dict below):
   extreme_proximity_mult: 0.5   within 0.5×ATR of extreme to trigger
 
 CHANGELOG:
+  v5.01 — Claude second opinion (shadow mode). When enabled in the new Claude
+           tab, every trade the bot enters is sent to Claude (claude-opus-5-5,
+           effort high, structured JSON verdict, server-side refusal
+           fallback) on a background thread with a snapshot of what the bot
+           knew at entry: the setup, its context and today's 5-min bars.
+           Claude answers TAKE/SKIP with a 1-5 confidence and a reason. The
+           bot still places every trade itself, so both sides of the
+           comparison are real fills. The verdict is stored in
+           trade_logs/claude_reviews.json (keyed by order id), the trade's
+           real outcome is added when it closes (_finalize_trade_close ->
+           claude_record_outcome), and the dashboard scores "bot alone" vs
+           "bot + Claude" vs "trades Claude would skip". Never blocks or
+           changes an order; any API failure is logged and recorded as an
+           error. 40 reviews/day cost cap. Off by default; forced off in
+           backtests (Claude has seen historical prices, so it can't be
+           backtested fairly). Also: two-column tabs now stack on phones.
   v5.00 — One file. nvda_autotrader.py (the bot) and build_dashboard.py (the
            control panel) merged into this single build_dashboard.py, per
            user request. `python build_dashboard.py` opens the dashboard;
@@ -1657,7 +1673,7 @@ try:
 except ImportError:
     print("ERROR: alpaca-trade-api is not installed. Double-click 'Start NVDA AutoTrader.bat'")
     print("  (it installs everything), or run:")
-    print("  python -m pip install --only-binary=:all: yfinance pandas numpy requests tzlocal msgpack websockets websocket-client aiohttp pyyaml deprecation python-dateutil")
+    print("  python -m pip install --only-binary=:all: yfinance pandas numpy requests tzlocal msgpack websockets websocket-client aiohttp pyyaml deprecation python-dateutil anthropic")
     print("  python -m pip install --no-deps alpaca-trade-api==3.2.0")
     exit(1)
 
@@ -2121,6 +2137,11 @@ def _finalize_trade_close(trade):
         today_list = [t for t in today_list if t.get("order_id") != oid]
     today_list.append(trade)
     state["closed_trades_today"] = today_list
+
+    try:
+        claude_record_outcome(trade)       # v5.01: score Claude's verdict
+    except Exception as e:
+        log(f"Claude outcome record failed: {e}", "WARN")
 
     if trade.get("outcome") == "LOSS":
         # No strategy-name guard needed: _run_shadow_check() itself no-ops when
@@ -3025,6 +3046,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     # dict ever ends up with a string opened_at.
                     "opened_at": _oa_str,
                     "days_open": _days_open,
+                    "claude":    t.get("claude"),
                 }
 
             payload = {
@@ -3416,6 +3438,295 @@ def start_tradingview_webhook():
                 time.sleep(5)
 
     threading.Thread(target=_run, daemon=True).start()
+
+# ═══════════════════════════════════════════════════════════════
+# CLAUDE SECOND OPINION (v5.01)
+# ═══════════════════════════════════════════════════════════════
+# Shadow mode: every bot trade is still placed exactly as before. In the
+# background, Claude reviews the setup the bot just entered and records
+# TAKE or SKIP with a confidence and a reason. When the trade closes, its
+# real outcome is stored next to the verdict, so the dashboard can compare
+# "bot alone" (every trade) with "bot + Claude" (only the trades Claude
+# would have taken). Claude never places, blocks or changes an order.
+#
+# Why shadow and not veto: every trade really happens, so both sides of the
+# comparison are real fills — no simulated "what if we'd skipped it".
+# Claude can't be backtested honestly (it has seen historical prices in
+# training), so this live paper record is the only fair test.
+
+CLAUDE_MODEL   = "claude-opus-5-5"
+CLAUDE_EFFORT  = "high"                       # judgment quality is the point of the experiment
+CLAUDE_ENABLED = (os.environ.get("NVDA_CLAUDE_ENABLED",
+                                 "1" if _SETTINGS.get("claude_enabled") else "0") == "1")
+CLAUDE_MAX_REVIEWS_PER_DAY = 40               # cost guard if something ever loops
+CLAUDE_REVIEWS_FILE = os.path.join("trade_logs", "claude_reviews.json")
+# List prices, $ per million tokens, for the cost estimate shown on the
+# dashboard. Thinking tokens bill as output. Update if pricing changes.
+CLAUDE_PRICE_IN, CLAUDE_PRICE_OUT = 4.00, 20.00
+
+CLAUDE_SYSTEM = """You review trade setups for an automated NVDA intraday paper-trading bot. This is an experiment measuring whether your judgment improves on the bot's own rules: each verdict you give is later scored against the trade's real outcome.
+
+Each request is one setup the bot has just entered: its strategy and the reason it fired, the entry, stop and target, the market context the bot computed, and recent 5-minute bars. You only see data that existed at the moment of entry.
+
+Decide whether you would take this trade. Answer "take" if you believe it has positive expected value given its reward-to-risk, and "skip" otherwise. Judge the setup on its merits: whether the signal looks genuine or like noise, how trend, VWAP, QQQ, higher-timeframe bias and time of day support or undermine it, whether the stop and target sit sensibly relative to recent volatility and levels, and anything in the data the rules may have missed. Use confidence 1-5 honestly, where 3 means close to a coin flip. Keep the reason to two or three sentences that name the specific evidence. Calibration matters more than caution."""
+
+CLAUDE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "decision":   {"type": "string", "enum": ["take", "skip"]},
+        "confidence": {"type": "integer", "enum": [1, 2, 3, 4, 5]},
+        "reason":     {"type": "string"},
+        "key_risks":  {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["decision", "confidence", "reason", "key_risks"],
+    "additionalProperties": False,
+}
+
+_CLAUDE_LOCK      = threading.Lock()              # guards the reviews file
+_CLAUDE_SEMAPHORE = threading.BoundedSemaphore(2)
+_claude_client    = None
+_claude_auth_failed = False
+
+
+def _claude_api_key():
+    return os.environ.get("ANTHROPIC_API_KEY") or _SETTINGS.get("anthropic_api_key", "")
+
+
+def _get_claude_client():
+    global _claude_client
+    if _claude_client is None:
+        import anthropic
+        _claude_client = anthropic.Anthropic(api_key=_claude_api_key(), timeout=180.0, max_retries=2)
+    return _claude_client
+
+
+# ── reviews store (trade_logs/claude_reviews.json, keyed by order_id) ──
+def claude_reviews_load(path=None):
+    path = path or CLAUDE_REVIEWS_FILE
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def _claude_reviews_upsert(order_id, **fields):
+    with _CLAUDE_LOCK:
+        recs = claude_reviews_load()
+        for r in recs:
+            if r.get("order_id") == order_id:
+                r.update(fields)
+                break
+        else:
+            recs.append(dict(order_id=order_id, **fields))
+        os.makedirs(os.path.dirname(CLAUDE_REVIEWS_FILE), exist_ok=True)
+        tmp = CLAUDE_REVIEWS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(recs, f, indent=1, cls=_SafeEncoder)
+        os.replace(tmp, CLAUDE_REVIEWS_FILE)
+
+
+def build_claude_snapshot(strategy, setup, candidates, df, trend, qqq_dir):
+    """Everything the bot knew at the moment of entry, as plain data."""
+    entry, stop, target = float(setup["entry"]), float(setup["stop"]), float(setup["target"])
+    risk = abs(entry - stop)
+    now = now_et()
+    snap = {
+        "setup": {
+            "strategy":       strategy,
+            "direction":      "long" if setup["direction"] == "bullish" else "short",
+            "entry":          round(entry, 2),
+            "stop":           round(stop, 2),
+            "target":         round(target, 2),
+            "risk_per_share": round(risk, 2),
+            "reward_to_risk": round(abs(target - entry) / risk, 2) if risk else None,
+            "bot_reason":     str(setup.get("reason", ""))[:400],
+        },
+        "context": {
+            "time_et":           now.strftime("%Y-%m-%d %H:%M %a"),
+            "kill_zone":         get_current_kill_zone(),
+            "minutes_to_close":  max(0, (16 * 60) - (now.hour * 60 + now.minute)),
+            "trend_25bar":       trend,
+            "qqq_direction":     qqq_dir,
+            "mtf_bias":          state.get("mtf_bias"),
+            "weekly_trend":      state.get("weekly_trend"),
+            "monthly_trend":     state.get("monthly_trend"),
+            "daily_momentum":    state.get("daily_momentum"),
+            "gap_direction":     state.get("gap_direction"),
+            "gap_pct":           state.get("gap_pct"),
+            "prev_close":        state.get("prev_close"),
+            "vwap":              state.get("last_vwap"),
+            "vwap_band":         [state.get("last_vwap_lower"), state.get("last_vwap_upper")],
+            "atr_5m":            state.get("last_atr"),
+            "range_3m":          [state.get("swing_low_3m"), state.get("swing_high_3m")],
+            "range_6m":          [state.get("swing_low_6m"), state.get("swing_high_6m")],
+            "trades_today":      state.get("trades_today", 0),
+            "bot_day_pnl":       round(float(state.get("daily_pnl", 0.0)), 2),
+            "other_signals_this_scan": [
+                {"strategy": n, "direction": c.get("direction"), "reward_to_risk": round(float(rr), 2)}
+                for rr, n, c in candidates if c is not setup],
+        },
+    }
+    try:
+        cutoff = (now - timedelta(days=7.5)).isoformat()
+        px = [p["p"] for p in state.get("price_history", []) if p.get("t", "") >= cutoff and p.get("p", 0) > 0]
+        if px:
+            snap["context"]["range_5d"] = [min(px), max(px)]
+    except Exception:
+        pass
+    if df is not None and len(df):
+        tail = df.iloc[-48:]
+        rows = ["time,open,high,low,close,volume"]
+        for ts, r in tail.iterrows():
+            rows.append(f"{ts.strftime('%H:%M')},{r['Open']:.2f},{r['High']:.2f},{r['Low']:.2f},"
+                        f"{r['Close']:.2f},{int(r['Volume'])}")
+        snap["bars_5m_today"] = "\n".join(rows)
+    return snap
+
+
+def claude_review(snapshot, client=None):
+    """One Claude call. Returns the verdict dict; raises on API errors."""
+    client = client or _get_claude_client()
+    bars = snapshot.get("bars_5m_today", "")
+    body = {k: v for k, v in snapshot.items() if k != "bars_5m_today"}
+    prompt = ("Setup and context (JSON):\n" + json.dumps(body, indent=1, cls=_SafeEncoder)
+              + "\n\nRecent 5-minute bars, today (ET):\n" + (bars or "(none)"))
+    t0 = time.time()
+    resp = client.beta.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=16000,
+        betas=["server-side-fallback-2026-07-01"],
+        fallbacks="default",                     # a declined request re-runs on Anthropic's recommended fallback
+        output_config={"effort": CLAUDE_EFFORT,
+                       "format": {"type": "json_schema", "schema": CLAUDE_SCHEMA}},
+        system=CLAUDE_SYSTEM,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    latency = round(time.time() - t0, 1)
+    usage = getattr(resp, "usage", None)
+    tin = int(getattr(usage, "input_tokens", 0) or 0)
+    tout = int(getattr(usage, "output_tokens", 0) or 0)
+    meta = {"model": getattr(resp, "model", CLAUDE_MODEL), "latency_s": latency,
+            "input_tokens": tin, "output_tokens": tout,
+            "cost_usd": round(tin / 1e6 * CLAUDE_PRICE_IN + tout / 1e6 * CLAUDE_PRICE_OUT, 4)}
+    if resp.stop_reason == "refusal":
+        cat = getattr(getattr(resp, "stop_details", None), "category", None)
+        raise RuntimeError(f"Claude declined to review (category: {cat})")
+    if resp.stop_reason == "max_tokens":
+        raise RuntimeError("Claude's answer was cut off (max_tokens)")
+    text = next((b.text for b in resp.content if getattr(b, "type", "") == "text"), "")
+    verdict = json.loads(text)
+    if verdict.get("decision") not in ("take", "skip"):
+        raise ValueError(f"unexpected verdict: {text[:200]}")
+    verdict.update(meta)
+    return verdict
+
+
+def _claude_reviews_today():
+    today = str(now_et().date())
+    return sum(1 for r in claude_reviews_load() if str(r.get("opened_at", ""))[:10] == today)
+
+
+def start_claude_review(trade, snapshot):
+    """Record the trade as pending and review it on a background thread."""
+    if not CLAUDE_ENABLED or trade is None or snapshot is None:
+        return
+    if _claude_auth_failed:
+        return
+    oid = trade.get("order_id")
+    if not oid:
+        return
+    if _claude_reviews_today() >= CLAUDE_MAX_REVIEWS_PER_DAY:
+        log(f"Claude review skipped — daily cap of {CLAUDE_MAX_REVIEWS_PER_DAY} reached", "WARN")
+        return
+    s = snapshot["setup"]
+    _claude_reviews_upsert(oid, status="pending", opened_at=now_et().isoformat(timespec="minutes"),
+                           strategy=s["strategy"], side=s["direction"], entry=s["entry"],
+                           stop=s["stop"], target=s["target"], qty=trade.get("qty"),
+                           reward_to_risk=s["reward_to_risk"])
+    trade["claude"] = {"status": "pending"}
+
+    def _run():
+        global _claude_auth_failed
+        with _CLAUDE_SEMAPHORE:
+            try:
+                v = claude_review(snapshot)
+                # file first, then the in-memory copy, so the two never disagree
+                _claude_reviews_upsert(oid, status="done", reviewed_at=now_et().isoformat(timespec="seconds"),
+                                       **{k: v.get(k) for k in ("decision", "confidence", "reason", "key_risks",
+                                                                "model", "latency_s", "input_tokens",
+                                                                "output_tokens", "cost_usd")})
+                trade["claude"] = {"status": "done", "decision": v["decision"],
+                                   "confidence": v["confidence"], "reason": v["reason"]}
+                log(f"CLAUDE {v['decision'].upper()} ({v['confidence']}/5) on {s['strategy']} "
+                    f"{s['direction']} @ ${s['entry']:.2f} — {v['reason'][:160]}", "TRADE")
+            except Exception as e:
+                msg = f"{type(e).__name__}: {e}"
+                if type(e).__name__ in ("AuthenticationError", "PermissionDeniedError"):
+                    _claude_auth_failed = True
+                    msg = "Anthropic API key rejected — check it in the dashboard's Claude tab"
+                elif isinstance(e, ImportError):
+                    msg = "the 'anthropic' package is not installed (pip install anthropic)"
+                _claude_reviews_upsert(oid, status="error", error=msg[:300])
+                trade["claude"] = {"status": "error", "error": msg[:200]}
+                log(f"Claude review failed: {msg[:200]}", "WARN")
+
+    threading.Thread(target=_run, daemon=True, name="claude-review").start()
+
+
+def claude_record_outcome(trade):
+    """Called when any trade closes: attach the real result to its review."""
+    oid = trade.get("order_id")
+    if not oid or "claude" not in trade:
+        return
+    entry, stop = float(trade.get("entry") or 0), float(trade.get("orig_stop") or trade.get("stop") or 0)
+    pnl = float(trade.get("pnl") or 0)
+    risk = abs(entry - stop) * float(trade.get("qty") or 0)
+    closed = trade.get("closed_at")
+    _claude_reviews_upsert(oid, outcome=trade.get("outcome"), pnl=round(pnl, 2),
+                           exit_px=trade.get("exit_px"),
+                           r_multiple=round(pnl / risk, 2) if risk else None,
+                           closed_at=closed.isoformat(timespec="minutes") if hasattr(closed, "isoformat") else str(closed or ""))
+
+
+def claude_stats(records):
+    """Scoreboard: bot alone vs. bot + Claude, from closed, reviewed trades."""
+    closed = [r for r in records if r.get("status") == "done" and r.get("pnl") is not None
+              and r.get("outcome")]
+
+    def grp(rs):
+        n = len(rs)
+        wins = sum(1 for r in rs if (r.get("pnl") or 0) > 0)
+        pnl = round(sum(r.get("pnl") or 0 for r in rs), 2)
+        rr = [r["r_multiple"] for r in rs if r.get("r_multiple") is not None]
+        return {"trades": n, "wins": wins, "win_rate": round(100 * wins / n, 1) if n else None,
+                "pnl": pnl, "avg_pnl": round(pnl / n, 2) if n else None,
+                "avg_r": round(sum(rr) / len(rr), 2) if rr else None}
+
+    take = [r for r in closed if r.get("decision") == "take"]
+    skip = [r for r in closed if r.get("decision") == "skip"]
+    right = sum(1 for r in closed if (r["decision"] == "take") == ((r.get("pnl") or 0) > 0))
+    out = {
+        "bot_alone": grp(closed), "with_claude": grp(take), "claude_skipped": grp(skip),
+        "claude_accuracy": round(100 * right / len(closed), 1) if closed else None,
+        "high_confidence_takes": grp([r for r in take if (r.get("confidence") or 0) >= 4]),
+        "pending": sum(1 for r in records if r.get("status") == "pending"
+                       or (r.get("status") == "done" and r.get("pnl") is None)),
+        "errors": sum(1 for r in records if r.get("status") == "error"),
+        "reviews": len(records),
+        "cost_usd": round(sum(r.get("cost_usd") or 0 for r in records), 2),
+    }
+    n = len(closed)
+    if n < 20:
+        out["verdict"] = f"Too early to tell — {n} closed trade{'s' if n != 1 else ''} reviewed. Aim for 30+ (ideally 50+) before trusting the comparison."
+    else:
+        diff = out["with_claude"]["pnl"] - out["bot_alone"]["pnl"]
+        out["verdict"] = (f"Following Claude would have {'added' if diff > 0 else 'cost'} "
+                          f"${abs(diff):,.2f} over {n} trades by skipping {len(skip)} of them "
+                          f"(skipped trades made ${out['claude_skipped']['pnl']:+,.2f}).")
+    return out
+
 
 # ═══════════════════════════════════════════════════════════════
 # DAILY RESET
@@ -6028,9 +6339,23 @@ def check_for_entry():
             "qty_mult":    best.get("qty_mult", 1.0),  # tier 2 range gets 2x qty
         }
 
+        # v5.01: capture what the bot knew at entry for Claude's second opinion
+        _claude_snap = None
+        if CLAUDE_ENABLED:
+            try:
+                _claude_snap = build_claude_snapshot(best_name, best, candidates, df, trend, qqq_dir)
+            except Exception as _cse:
+                log(f"Claude snapshot failed: {_cse}", "WARN")
+
         _place_trade(best["direction"], best["entry"], best["stop"],
                      best["target"], best["risk"], fvg_compat,
                      best_name, trend, qqq_dir)
+
+        if _claude_snap is not None:
+            try:
+                start_claude_review(get_bot_trade(), _claude_snap)
+            except Exception as _cre:
+                log(f"Claude review could not start: {_cre}", "WARN")
 
         # v4.71/v4.72: if a disabled sub-strategy also had a valid (would-have-
         # traded) setup this same scan, carry it along on the trade that
@@ -8034,6 +8359,9 @@ def run_bot():
     start_dashboard_server()
     start_tradingview_webhook()
     log(f"Mode: {'PAPER' if IS_PAPER else '*** LIVE MONEY ***'} | Signal source: {SIGNAL_SOURCE}")
+    if CLAUDE_ENABLED:
+        log(f"Claude second opinion ON ({CLAUDE_MODEL}, shadow mode — reviews every bot trade, never blocks one)"
+            + ("" if _claude_api_key() else " — WARNING: no Anthropic API key set"))
 
     log("Connecting to Alpaca...")
     api_result = get_alpaca()
@@ -8439,7 +8767,7 @@ import webbrowser
 # CONFIG
 # ═══════════════════════════════════════════════════════════════
 
-VERSION         = "v5.00"
+VERSION         = "v5.01"
 HERE            = os.path.dirname(os.path.abspath(__file__))
 BOT_SCRIPT      = os.path.abspath(__file__)   # Start Bot runs this same file…
 BOT_ARGS        = ["--run-bot"]                # …in bot mode
@@ -8463,6 +8791,8 @@ DEFAULT_SETTINGS = {
     "tv_port":           8090,
     "tv_passphrase":     "",
     "tv_public_url":     "",        # your ngrok / cloudflared https URL (display only)
+    "claude_enabled":    False,     # Claude second opinion on every bot trade (shadow mode)
+    "anthropic_api_key": "",
 }
 
 # Bot exit codes that mean "don't restart, a human needs to look":
@@ -8520,6 +8850,10 @@ def public_settings(s):
         "tv_port":        int(s["tv_port"]),
         "tv_passphrase":  s["tv_passphrase"],   # needed to paste into the Pine inputs
         "tv_public_url":  s["tv_public_url"],
+        "claude_enabled":       bool(s["claude_enabled"]),
+        "has_anthropic_key":    bool(s["anthropic_api_key"]),
+        "anthropic_key_masked": mask_key(s["anthropic_api_key"]),
+        "claude_model":         CLAUDE_MODEL,
         "settings_file":  SETTINGS_FILE,
     }
 
@@ -8560,8 +8894,43 @@ def apply_settings_update(body):
         s["tv_public_url"] = str(body["tv_public_url"]).strip()[:300]
     if s["tv_enabled"] and not s["tv_passphrase"]:
         raise ValueError("Set a webhook passphrase before enabling TradingView")
+    if body.get("clear_anthropic_key"):
+        s["anthropic_api_key"] = ""
+        s["claude_enabled"] = False
+    akey = str(body.get("anthropic_api_key") or "").strip()
+    if akey:
+        if not akey.startswith("sk-ant-"):
+            raise ValueError("That doesn't look like an Anthropic API key (they start with sk-ant-)")
+        s["anthropic_api_key"] = akey
+    if "claude_enabled" in body:
+        s["claude_enabled"] = bool(body["claude_enabled"])
+    if s["claude_enabled"] and not s["anthropic_api_key"]:
+        raise ValueError("Add your Anthropic API key before turning on Claude reviews")
     save_settings(s)
     return s
+
+
+def test_anthropic_key(key):
+    """Checks the key without spending anything (model lookup is free)."""
+    if not key:
+        return {"ok": False, "error": "Enter your Anthropic API key"}
+    try:
+        import anthropic
+    except ImportError:
+        return {"ok": False, "error": "The 'anthropic' package isn't installed — run the launcher again or: pip install anthropic"}
+    try:
+        m = anthropic.Anthropic(api_key=key, timeout=20.0, max_retries=1).models.retrieve(CLAUDE_MODEL)
+        return {"ok": True, "model": m.id, "name": getattr(m, "display_name", m.id)}
+    except anthropic.AuthenticationError:
+        return {"ok": False, "error": "Anthropic rejected this key (check it at console.anthropic.com → API Keys)"}
+    except anthropic.PermissionDeniedError:
+        return {"ok": False, "error": f"This key can't use {CLAUDE_MODEL} — check your Anthropic account/workspace"}
+    except anthropic.NotFoundError:
+        return {"ok": False, "error": f"Model {CLAUDE_MODEL} not found for this key"}
+    except anthropic.APIConnectionError:
+        return {"ok": False, "error": "Could not reach api.anthropic.com — check your internet connection"}
+    except anthropic.APIStatusError as e:
+        return {"ok": False, "error": f"Anthropic returned HTTP {e.status_code}"}
 
 
 def test_alpaca_keys(key, secret, mode):
@@ -8647,6 +9016,8 @@ class BotProcess:
             if self.is_running():
                 return
             env = os.environ.copy()
+            if s["anthropic_api_key"]:
+                env["ANTHROPIC_API_KEY"] = s["anthropic_api_key"]
             env.update({
                 "ALPACA_API_KEY":     s["alpaca_api_key"],
                 "ALPACA_SECRET_KEY":  s["alpaca_secret_key"],
@@ -8657,6 +9028,7 @@ class BotProcess:
                 "NVDA_TV_ENABLED":    "1" if s["tv_enabled"] else "0",
                 "NVDA_TV_PASSPHRASE": s["tv_passphrase"],
                 "NVDA_TV_PORT":       str(s["tv_port"]),
+                "NVDA_CLAUDE_ENABLED": "1" if s["claude_enabled"] else "0",
                 "PYTHONIOENCODING":   "utf-8",
                 "PYTHONUNBUFFERED":   "1",
             })
@@ -8832,6 +9204,10 @@ class PanelHandler(BaseHTTPRequestHandler):
                         after = int(part[6:] or 0)
                 lines, last = BOT.console_since(after)
                 return self._send(200, {"lines": lines[-1000:], "last": last})
+            if path == "/api/claude/stats":
+                recs = claude_reviews_load(os.path.join(HERE, CLAUDE_REVIEWS_FILE))
+                return self._send(200, {"stats": claude_stats(recs),
+                                        "recent": list(reversed(recs))[:40]})
             if path == "/api/pine":
                 try:
                     with open(PINE_FILE, "r", encoding="utf-8") as f:
@@ -8872,6 +9248,9 @@ class PanelHandler(BaseHTTPRequestHandler):
                 mode = body.get("trading_mode") if body.get("trading_mode") in ("paper", "live") \
                     else s["trading_mode"]
                 return self._send(200, test_alpaca_keys(key, sec, mode))
+            if path == "/api/test_claude":
+                key = str(body.get("anthropic_api_key") or "").strip() or load_settings()["anthropic_api_key"]
+                return self._send(200, test_anthropic_key(key))
             if path == "/api/generate_passphrase":
                 return self._send(200, {"ok": True, "passphrase": secrets.token_urlsafe(24)})
             if path == "/api/bot/start":
@@ -9046,7 +9425,8 @@ h2{font-size:18px;margin:0 0 4px} .sub{color:var(--muted);margin:0 0 16px;font-s
 .trade{border:1px solid var(--border);border-radius:10px;padding:12px;background:var(--panel-2)}
 .trade + .trade{margin-top:10px}
 .trade .top{display:flex;align-items:center;gap:8px;margin-bottom:10px}
-.dir{font:700 11px var(--mono);padding:3px 8px;border-radius:6px}
+.dir{font:700 11px var(--mono);padding:3px 8px;border-radius:6px;white-space:nowrap}
+#cl-score .sm{white-space:normal}
 .dir.long{background:var(--up-soft);color:var(--up)} .dir.short{background:var(--down-soft);color:var(--down)}
 .tag{font:600 11px var(--mono);padding:3px 8px;border-radius:6px;background:var(--raise);color:var(--text-2)}
 .trade .pnl{margin-left:auto;font:600 16px var(--mono)}
@@ -9115,7 +9495,8 @@ pre.code{margin:0;max-height:420px;overflow:auto;background:var(--panel-2);borde
 
 /* ── responsive ── */
 @media (max-width:1280px){.kpis{grid-template-columns:repeat(3,minmax(0,1fr))}}
-@media (max-width:1080px){.main-cols{grid-template-columns:minmax(0,1fr)}}
+@media (max-width:1080px){.main-cols{grid-template-columns:minmax(0,1fr)} #cl-grid{grid-template-columns:minmax(0,1fr)!important}}
+@media (max-width:860px){#trades-grid,#settings-grid,#tv-grid,#cl-score{grid-template-columns:minmax(0,1fr)!important}}
 @media (max-width:860px){
   .app{grid-template-columns:1fr}
   .side{position:static;height:auto;flex-direction:row;overflow-x:auto;padding:6px 10px;border-right:0;border-bottom:1px solid var(--border)}
@@ -9135,6 +9516,7 @@ ICONS = {
     "overview": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m7 15 4-4 3 3 5-6"/></svg>',
     "trades":   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 7h11l-3-3M17 17H6l3 3"/></svg>',
     "signals":  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2"/><path d="M16.2 7.8a6 6 0 0 1 0 8.4M7.8 16.2a6 6 0 0 1 0-8.4M19.1 4.9a10 10 0 0 1 0 14.2M4.9 19.1a10 10 0 0 1 0-14.2"/></svg>',
+    "claude":   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.6L19.5 10l-5.6 1.9L12 17.5l-1.9-5.6L4.5 10l5.6-1.4z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/></svg>',
     "console":  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-5-6-5M12 19h8"/></svg>',
     "settings": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>',
     "tv":       '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="5" width="20" height="13" rx="2"/><path d="M8 21h8M7 13l3-3 2 2 4-4"/></svg>',
@@ -9157,6 +9539,7 @@ BODY_HTML = r"""
     <button class="nav active" data-view="overview">__I_overview__<span>Overview</span></button>
     <button class="nav" data-view="trades">__I_trades__<span>Trades</span><span class="badge" id="nav-trades">0</span></button>
     <button class="nav" data-view="signals">__I_signals__<span>Signals</span><span class="badge" id="nav-signals">0</span></button>
+    <button class="nav panel-only" data-view="claude">__I_claude__<span>Claude</span><span class="badge" id="nav-claude">off</span></button>
     <button class="nav panel-only" data-view="console">__I_console__<span>Console</span></button>
     <button class="nav panel-only" data-view="settings">__I_settings__<span>Settings</span></button>
     <button class="nav" data-view="tradingview">__I_tv__<span>TradingView</span></button>
@@ -9247,6 +9630,39 @@ BODY_HTML = r"""
     <section class="view" id="view-signals">
       <h2>Signals today</h2><p class="sub">Every FVG / VWAP setup the bot scored today, newest first. Score is out of 9.</p>
       <div class="card"><div class="card-b" id="sig-list"><div class="empty">No setups detected yet today</div></div></div>
+    </section>
+
+    <!-- ═══ CLAUDE ═══ -->
+    <section class="view" id="view-claude">
+      <h2>Claude second opinion</h2>
+      <p class="sub">Claude reviews every trade the bot takes and says whether it would have taken it. The bot still places every trade, so both sides of the comparison are real results, not simulations.</p>
+      <div class="banner" id="cl-verdict"><span class="grow t2">Loading…</span></div>
+      <div class="grid" style="grid-template-columns:repeat(3,minmax(0,1fr))" id="cl-score">
+        <div class="card kpi"><div class="lbl">Bot alone <span class="muted">(every trade)</span></div><div class="val" id="cl-bot">—</div><div class="sm" id="cl-bot-s">—</div></div>
+        <div class="card kpi"><div class="lbl">Bot + Claude <span class="muted">(only trades Claude approved)</span></div><div class="val" id="cl-with">—</div><div class="sm" id="cl-with-s">—</div></div>
+        <div class="card kpi"><div class="lbl">Trades Claude would skip</div><div class="val" id="cl-skip">—</div><div class="sm" id="cl-skip-s">Negative here means Claude saved money</div></div>
+      </div>
+      <div class="chart-foot" id="cl-meta" style="margin:10px 0 16px"></div>
+      <div class="grid" style="grid-template-columns:minmax(0,360px) minmax(0,1fr)" id="cl-grid">
+        <div class="card">
+          <div class="card-h"><h3>Settings</h3><div class="right"><span class="pill" id="cl-state"><span class="dot"></span>Off</span></div></div>
+          <div class="card-b">
+            <label class="check" style="padding-top:0"><input type="checkbox" id="cl-enabled"><div><b>Review every bot trade with Claude</b><span id="cl-model-note">Shadow mode: Claude only gives an opinion. It never places, blocks or changes a trade.</span></div></label>
+            <div class="field">
+              <label for="cl-key">Anthropic API key</label>
+              <div class="input-row"><input class="input mono" id="cl-key" type="password" autocomplete="new-password" spellcheck="false" placeholder="sk-ant-…"><button class="btn" onclick="testClaude()" id="cl-test">Test</button></div>
+              <span class="hint">From console.anthropic.com → API Keys. Billed per use, roughly $0.05–0.10 per review. Stored only on this computer.</span>
+            </div>
+            <div class="row"><button class="btn primary" onclick="saveClaude()">Save</button><div class="spacer"></div><button class="btn ghost sm down" onclick="clearClaudeKey()">Remove key</button></div>
+            <div id="cl-msg"></div>
+            <p class="muted" style="font-size:12px;margin:14px 0 0">Changes apply the next time the bot starts. Claude can't be backtested fairly (it has seen past prices), so this live paper record is the real test.</p>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-h"><h3>Recent reviews</h3></div>
+          <div class="card-b"><div class="log" id="cl-recent" style="max-height:520px"><div class="empty">No reviews yet. Turn Claude on, then Start Bot.</div></div></div>
+        </div>
+      </div>
     </section>
 
     <!-- ═══ CONSOLE ═══ -->
@@ -9480,6 +9896,7 @@ function showView(v) {
   $$('.nav').forEach(e => e.classList.toggle('active', e.dataset.view === v));
   if (location.hash !== '#' + v) history.replaceState(null, '', '#' + v);
   if (v === 'tradingview') loadPine();
+  if (v === 'claude') loadClaude();
   if (v === 'console') { pollConsole(); scrollConsole(); }
   if (v === 'overview' && chart) chart.resize();
 }
@@ -9769,6 +10186,7 @@ function tradeCard(t) {
   return `<div class="trade">
     <div class="top"><span class="dir ${long ? 'long' : 'short'}">${long ? '▲ LONG' : '▼ SHORT'}</span>
       <span class="tag">${manual ? 'MANUAL' : esc(t.strategy || 'BOT')}</span>
+      ${claudeTag(t.claude)}
       ${t.days_open > 0 ? `<span class="tag warn">${esc(t.days_open)}d open</span>` : ''}
       <span class="pnl ${pnl >= 0 ? 'up' : 'down'}">${signed(pnl)}</span></div>
     <div class="kv"><div>Entry<b>${money(t.entry)}</b></div><div>${stopLbl}<b class="down">${money(t.stop)}</b></div><div>Target<b class="up">${money(t.target)}</b></div><div>Qty<b>${esc(t.qty)}</b></div></div>
@@ -9891,6 +10309,12 @@ async function loadSettings() {
   $('#tv-pass').value = settings.tv_passphrase || '';
   $('#tv-port').value = settings.tv_port;
   $('#tv-url').value = settings.tv_public_url || '';
+  $('#cl-enabled').checked = settings.claude_enabled;
+  $('#cl-key').placeholder = settings.has_anthropic_key ? settings.anthropic_key_masked + '  (saved)' : 'sk-ant-…';
+  $('#cl-model-note').textContent = `Uses ${settings.claude_model}. Shadow mode: Claude only gives an opinion — it never places, blocks or changes a trade.`;
+  const cs = $('#cl-state'), on = settings.claude_enabled;
+  cs.className = 'pill ' + (on ? 'ok' : ''); cs.innerHTML = `<span class="dot"></span>${on ? 'On' : 'Off'}`;
+  $('#nav-claude').textContent = on ? 'on' : 'off';
   renderTVInfo();
 }
 function srcHint(s) {
@@ -9979,6 +10403,69 @@ async function saveTV() {
 function copyText(id) { navigator.clipboard.writeText($('#' + id).textContent).then(() => toast('Copied')); }
 function copyVal(id) { navigator.clipboard.writeText($('#' + id).value).then(() => toast('Copied')); }
 
+/* ── Claude second opinion ───────────────────────────────── */
+function claudeTag(c) {
+  if (!c) return '';
+  if (c.status === 'pending') return '<span class="tag" title="Claude is reviewing this trade">Claude …</span>';
+  if (c.status === 'error') return `<span class="tag warn" title="${esc(c.error || '')}">Claude error</span>`;
+  const take = c.decision === 'take';
+  return `<span class="dir ${take ? 'long' : 'short'}" title="${esc(c.reason || '')}">Claude ${take ? 'TAKE' : 'SKIP'} ${esc(c.confidence)}/5</span>`;
+}
+function grpLine(g) {
+  if (!g || !g.trades) return ['—', 'No closed trades yet'];
+  return [signed(g.pnl), `${g.trades} trades · ${g.win_rate}% win · avg ${g.avg_r ?? '—'}R`];
+}
+async function loadClaude() {
+  if (APP.standalone) return;
+  const r = await api('/api/claude/stats', undefined, { timeout: 6000 });
+  if (r.status !== 200) return;
+  const st = r.data.stats, recent = r.data.recent || [];
+  $('#cl-verdict').innerHTML = `<span class="grow">${esc(st.verdict)}</span>`;
+  [['bot', st.bot_alone], ['with', st.with_claude], ['skip', st.claude_skipped]].forEach(([k, g]) => {
+    const [v, sub] = grpLine(g);
+    const el = $('#cl-' + k); el.textContent = v;
+    el.className = 'val ' + (g && g.trades ? (g.pnl >= 0 ? 'up' : 'down') : '');
+    if (k !== 'skip' || !(g && g.trades)) $('#cl-' + k + '-s').textContent = sub;
+    else $('#cl-skip-s').textContent = sub + (g.pnl < 0 ? ' · Claude avoided these losses' : ' · Claude would have missed these gains');
+  });
+  const hc = st.high_confidence_takes;
+  $('#cl-meta').innerHTML = [
+    `Claude right: <b>${st.claude_accuracy ?? '—'}${st.claude_accuracy != null ? '%' : ''}</b>`,
+    `High-confidence takes (4–5/5): <b>${hc.trades ? signed(hc.pnl) + ' over ' + hc.trades + (hc.trades === 1 ? ' trade' : ' trades') : '—'}</b>`,
+    `Reviews: <b>${st.reviews}</b> (${st.pending} awaiting result${st.errors ? ', ' + st.errors + ' failed' : ''})`,
+    `Claude cost so far: <b>$${(st.cost_usd || 0).toFixed(2)}</b>`,
+  ].map(x => `<span>${x}</span>`).join('');
+  $('#cl-recent').innerHTML = recent.length ? recent.map(rv => {
+    const res = rv.pnl == null ? '<span class="muted">open</span>' : `<span class="${rv.pnl >= 0 ? 'up' : 'down'}">${signed(rv.pnl)}</span>`;
+    const verdict = rv.status === 'done' ? `<span class="dir ${rv.decision === 'take' ? 'long' : 'short'}">${rv.decision === 'take' ? 'TAKE' : 'SKIP'} ${esc(rv.confidence)}/5</span>`
+                  : rv.status === 'error' ? '<span class="tag warn">error</span>' : '<span class="tag">pending</span>';
+    const right = rv.status === 'done' && rv.pnl != null ? ((rv.decision === 'take') === (rv.pnl > 0) ? ' <span class="up">✓</span>' : ' <span class="down">✗</span>') : '';
+    return `<div class="e" style="grid-template-columns:96px 1fr auto">
+      <span class="mono muted" style="font-size:11px">${esc((rv.opened_at || '').slice(5, 16).replace('T', ' '))}</span>
+      <span><b>${esc(rv.strategy)}</b> <span class="t2">${esc(rv.side)} @ ${money(rv.entry)}</span> ${verdict}${right}
+        <div class="muted" style="font-size:12px;margin-top:3px">${esc(rv.reason || rv.error || 'Waiting for Claude…')}</div></span>
+      <span class="mono">${res}</span></div>`;
+  }).join('') : '<div class="empty">No reviews yet. Turn Claude on, then Start Bot.</div>';
+}
+async function testClaude() {
+  const b = $('#cl-test'); b.disabled = true; b.textContent = 'Testing…';
+  const r = await api('/api/test_claude', { anthropic_api_key: $('#cl-key').value }, { timeout: 30000 });
+  showMsg('#cl-msg', r.data.ok ? `Key works — ${r.data.name} is available.` : r.data.error, r.data.ok);
+  b.disabled = false; b.textContent = 'Test';
+}
+async function saveClaude() {
+  const body = { claude_enabled: $('#cl-enabled').checked };
+  const k = $('#cl-key').value.trim(); if (k) body.anthropic_api_key = k;
+  const r = await api('/api/settings', body);
+  if (r.data.ok) { $('#cl-key').value = ''; showMsg('#cl-msg', r.data.restart_needed ? 'Saved. Restart the bot to apply.' : 'Saved. Claude will review trades from the next Start Bot.', true); loadSettings(); }
+  else showMsg('#cl-msg', r.data.error || 'Could not save', false);
+}
+async function clearClaudeKey() {
+  if (!confirm('Remove the saved Anthropic key and turn Claude reviews off?')) return;
+  const r = await api('/api/settings', { clear_anthropic_key: true });
+  showMsg('#cl-msg', r.data.ok ? 'Key removed, Claude reviews off.' : r.data.error, r.data.ok); loadSettings();
+}
+
 /* ── manual trade modal ──────────────────────────────────── */
 let mDir = null, mMult = 1, mManaged = true, mPx = 0, mPoll = null;
 function openTradeModal() {
@@ -10056,6 +10543,7 @@ window.addEventListener('load', () => {
   setInterval(pollBot, 3000);
   setInterval(() => { if ($('#view-console').classList.contains('active') || conAfter === 0) pollConsole(); }, 2000);
   setInterval(renderKZ, 30000);
+  setInterval(() => { if ($('#view-claude').classList.contains('active')) loadClaude(); }, 10000);
 });
 """
 

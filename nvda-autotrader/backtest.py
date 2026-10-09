@@ -427,11 +427,13 @@ def load_bot(feed, broker, quiet):
     os.environ.setdefault("ALPACA_API_KEY", "backtest")
     os.environ.setdefault("ALPACA_SECRET_KEY", "backtest")
     os.environ["NVDA_TV_ENABLED"] = "0"
+    os.environ["NVDA_CLAUDE_ENABLED"] = "0"     # never call the paid Claude API from a backtest
     sys.path.insert(0, HERE)
     with contextlib.redirect_stdout(io.StringIO()):
         import build_dashboard as bot
 
     bot.datetime = SimDatetime
+    bot.CLAUDE_ENABLED = False                 # belt and braces: Claude can't be backtested fairly anyway
     bot.print = lambda *a, **k: None          # NEW SESSION banners etc.
     bot.time = types.SimpleNamespace(sleep=lambda s: None, time=lambda: Clock.now.timestamp(),
                                      strftime=_real_time.strftime)
