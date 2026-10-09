@@ -1,12 +1,11 @@
-# NVDA AutoTrader (v4.99)
+# NVDA AutoTrader (v5.00)
 
 An algorithmic paper-trading bot for NVDA on Alpaca, with a browser control panel and a TradingView port.
 
 | File | What it is |
 |---|---|
-| `build_dashboard.py` | **The app.** Control panel + dashboard. Starts/stops the bot and holds your keys. |
-| `nvda_autotrader.py` | The trading bot (strategies, orders, exits). The panel runs it for you. |
-| `nvda_strategy.pine` | TradingView Pine Script version of the strategies. |
+| `build_dashboard.py` | **Everything in one file:** the trading bot, the control panel and the dashboard. The only file you run. |
+| `nvda_strategy.pine` | TradingView Pine Script version of the strategies (separate because TradingView only runs Pine). |
 | `backtest.py` | Backtester: replays historical bars through the bot's real code. |
 | `tests/` | Automated tests (no network, no real orders). |
 | `nvda_settings.json` | Created by the Settings tab. Holds your keys, so **never commit or share it** (it's git-ignored). |
@@ -25,9 +24,11 @@ Your browser opens **http://127.0.0.1:8080**. Then:
 
 When your keys change, paste the new ones in Settings, save, and click **Restart now**. You never edit code for keys.
 
+**How the one file works:** `python build_dashboard.py` runs the dashboard. **Start Bot** launches the same file a second time with `--run-bot`, so the bot runs as its own process. That way Stop can always end it, and if the bot freezes, its watchdog restarts it without taking the dashboard down. You can also run the bot alone with `python build_dashboard.py --run-bot` (it serves a bot-only dashboard on http://127.0.0.1:8080).
+
 ### Run it every morning (Windows Task Scheduler)
 
-Change your existing 8:20 AM task to run this instead of `nvda_autotrader.py`:
+Change your existing 8:20 AM task (it used to run `nvda_autotrader.py`, which no longer exists) to:
 
 ```
 python build_dashboard.py --autostart --no-browser
@@ -35,7 +36,7 @@ python build_dashboard.py --autostart --no-browser
 
 The panel starts, launches the bot with your saved keys, and restarts it if it crashes (pauses after 5 crashes in 10 minutes). Open http://127.0.0.1:8080 any time to check on it.
 
-> Only run one of the two. If an old task still starts `nvda_autotrader.py` directly, the dashboard says *"A bot started outside this panel is running"*.
+> If an old copy of `nvda_autotrader.py` is still being started somewhere, delete it. The dashboard says *"A bot started outside this panel is running"* when it detects one.
 
 ## What's in the dashboard
 
@@ -64,7 +65,7 @@ Ported: SPIKE momentum, SPIKE 5-day extreme, VWAP bounce, FVG retrace, SWING-6M 
 2. Settings → *Where trades come from* → **TradingView alerts** (or **Both**) → **Restart now**.
 3. Expose the receiver: `ngrok http 8090` (or `cloudflared tunnel --url http://127.0.0.1:8090`). TradingView only calls public HTTPS URLs.
 4. In the Pine script's inputs, paste the same passphrase.
-5. Create Alert → Condition: *NVDA AutoTrader v4.99* → **Order fills only** → Webhook URL `https://<your-tunnel>/tv_webhook` → Message `{{strategy.order.alert_message}}`.
+5. Create Alert → Condition: *NVDA AutoTrader v5.00* → **Order fills only** → Webhook URL `https://<your-tunnel>/tv_webhook` → Message `{{strategy.order.alert_message}}`.
 
 Every alert goes through the same checks as a dashboard trade: market hours, a fresh live price, stop/target on the correct sides of it, and size capped at `max_position_pct`. The bot holds one NVDA position at a time, so an entry alert is skipped while anything is open. Exact repeats within 30 s (TradingView retries) are dropped. Results show in the Console.
 
@@ -99,7 +100,7 @@ How exits are simulated: the bot polls every 15 s, so each 5-minute bar is repla
 python -m unittest discover -s tests -v
 ```
 
-28 tests, about 50 s, no network and no real orders. They cover the control panel API and security guards, Start/Stop and auto-restart, keys reaching the bot, manual trades and every TradingView webhook rule (through a simulated Alpaca account), the backtester's fill logic and data loaders, and a full backtest replay.
+29 tests, about 50 s, no network and no real orders. They cover the control panel API and security guards, Start/Stop and auto-restart, the real bot booting from the same file, keys reaching the bot, manual trades and every TradingView webhook rule (through a simulated Alpaca account), the backtester's fill logic and data loaders, and a full backtest replay.
 
 ## Security notes
 

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-NVDA AutoTrader — Backtester v4.99
+NVDA AutoTrader — Backtester v5.00
 ==================================
 
 Replays historical 5-minute bars through the bot's REAL code: the actual
 check_for_entry(), _place_trade(), monitor_trade() / _monitor_bot_trade(),
-reset_daily_state() and end_of_day_check() from nvda_autotrader.py run
+reset_daily_state() and end_of_day_check() from build_dashboard.py run
 unchanged. Only the outside world is replaced:
 
   clock   — datetime.now() returns simulated time
@@ -429,7 +429,7 @@ def load_bot(feed, broker, quiet):
     os.environ["NVDA_TV_ENABLED"] = "0"
     sys.path.insert(0, HERE)
     with contextlib.redirect_stdout(io.StringIO()):
-        import nvda_autotrader as bot
+        import build_dashboard as bot
 
     bot.datetime = SimDatetime
     bot.print = lambda *a, **k: None          # NEW SESSION banners etc.

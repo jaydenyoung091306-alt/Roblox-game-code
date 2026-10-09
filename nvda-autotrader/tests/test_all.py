@@ -1,5 +1,5 @@
 """
-NVDA AutoTrader test suite (v4.99) — no network, no real orders.
+NVDA AutoTrader test suite (v5.00) — no network, no real orders.
 
     cd nvda-autotrader
     python -m unittest discover -s tests -v
@@ -8,7 +8,8 @@ Covers:
   PanelTests        control panel API, settings rules, secret never leaked,
                     security guards (Host / Origin / content type / CORS)
   BotProcessTests   Start/Stop, keys handed to the bot, exit codes,
-                    auto-restart on crash, no restart on bad keys
+                    auto-restart on crash, no restart on bad keys, and the real
+                    bot booting from this same file (--run-bot)
   EndToEndTests     browser → panel → bot server → simulated Alpaca:
                     manual trade open/close, TradingView webhook rules
   BrokerSimTests    the backtester's simulated broker fills
@@ -106,6 +107,7 @@ def load_panel():
     bd.PRICE_HIST_FILE = os.path.join(TMP, "nvda_price_history.json")
     bd.CONSOLE_LOG = os.path.join(TMP, "bot_console.log")
     bd.BOT_SCRIPT = STUB
+    bd.BOT_ARGS = []
     return bd
 
 
@@ -246,6 +248,21 @@ class BotProcessTests(unittest.TestCase):
         self._mode("run")
         self.assertTrue(wait_for(self.bp.is_running, timeout=10))
 
+    def test_start_bot_runs_this_file_in_bot_mode(self):
+        """The real thing: Start Bot launches build_dashboard.py --run-bot and the bot boots.
+        Uses fake keys, so it can never trade; stopped as soon as the banner appears."""
+        self.bd.BOT_SCRIPT, self.bd.BOT_ARGS = os.path.join(HERE, "build_dashboard.py"), ["--run-bot"]
+        self.bd.save_settings(dict(self.bd.DEFAULT_SETTINGS, alpaca_api_key="PKFAKEKEY", alpaca_secret_key="fake",
+                                   bot_port=free_port(), tv_enabled=False))
+        try:
+            self.bp.start()
+            booted = wait_for(lambda: any(f"NVDA AUTO TRADER {self.bd.VERSION}" in l for _, l in self.bp.lines), timeout=90)
+            self.assertTrue(booted, "\n".join(l for _, l in self.bp.lines))
+            self.assertTrue(wait_for(lambda: any("Mode: PAPER" in l for _, l in self.bp.lines), timeout=30))
+        finally:
+            self.bp.stop()
+            self.bd.BOT_SCRIPT, self.bd.BOT_ARGS = STUB, []
+
     def test_clean_exit_does_not_restart(self):
         self._mode("0")
         self.bp.start()
@@ -267,7 +284,7 @@ class EndToEndTests(unittest.TestCase):
         cls.broker.px = 180.0
         cwd = os.getcwd()
         os.chdir(TMP)
-        import nvda_autotrader as bot
+        import build_dashboard as bot
         os.chdir(cwd)
         cls.bot = bot
         bot.get_alpaca = lambda: (cls.broker, 100_000.0)
