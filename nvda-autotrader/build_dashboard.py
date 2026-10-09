@@ -1655,7 +1655,10 @@ STATE_FILE = os.path.join("trade_logs", "session_state.json")
 try:
     import alpaca_trade_api as tradeapi
 except ImportError:
-    print("ERROR: Run: pip install alpaca-trade-api")
+    print("ERROR: alpaca-trade-api is not installed. Double-click 'Start NVDA AutoTrader.bat'")
+    print("  (it installs everything), or run:")
+    print("  python -m pip install --only-binary=:all: yfinance pandas numpy requests tzlocal msgpack websockets websocket-client aiohttp pyyaml deprecation python-dateutil")
+    print("  python -m pip install --no-deps alpaca-trade-api==3.2.0")
     exit(1)
 
 try:

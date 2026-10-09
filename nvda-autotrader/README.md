@@ -20,9 +20,12 @@ No Python yet? Install it from https://www.python.org/downloads/ and tick **"Add
 Or from a command prompt in this folder:
 
 ```bash
-pip install alpaca-trade-api yfinance pandas numpy requests tzlocal
+python -m pip install --only-binary=:all: yfinance pandas numpy requests tzlocal msgpack websockets websocket-client aiohttp pyyaml deprecation python-dateutil
+python -m pip install --no-deps alpaca-trade-api==3.2.0
 python build_dashboard.py
 ```
+
+Why two install lines: `alpaca-trade-api` pins old `msgpack`/`PyYAML` versions that have no prebuilt download for current Python, so a plain `pip install alpaca-trade-api` fails with *"Failed building wheel"*. Installing its helpers first (current, prebuilt) and then it with `--no-deps` avoids compiling anything.
 
 Your browser opens **http://127.0.0.1:8080**. Then:
 
