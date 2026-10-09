@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NVDA AUTO TRADER v5.01 — bot + control panel + dashboard, one file
+NVDA AUTO TRADER v5.03 — bot + control panel + dashboard, one file
 ===================================================================
 
 CLAUDE AI CONTEXT — READ THIS FIRST IF STARTING A NEW CHAT
@@ -125,6 +125,38 @@ KEY CONFIG (see CONFIG dict below):
   extreme_proximity_mult: 0.5   within 0.5×ATR of extreme to trigger
 
 CHANGELOG:
+  v5.03 — After-hours loop and new-day reset bugs, found while building the
+           multi-symbol backtest:
+             1) After 16:00 run_bot() entered a nested `while True` that never
+                returned to the main loop and never refreshed the watchdog
+                heartbeat, so the v4.96 watchdog os._exit()-ed the bot ~5
+                minutes after every close and mid-SWING-6M-hold (the 2026-10-02
+                incident in v4.97 was very likely this, not a network hang).
+                Under Task Scheduler's 3 retries that left an overnight short
+                unmonitored. With a position carried overnight it also never
+                scanned, reset the day, ran EOD checks or saved summaries
+                again until that position closed. After-hours polls are now
+                ordinary main-loop iterations (heartbeat + reset_daily_state at
+                the top, monitor_trade, sleep, continue).
+             2) reset_daily_state() wiped active_trades after closing non-
+                exempt positions on a new day, so those closes never reached
+                the trade log, daily P&L or Claude's scoreboard. The trades are
+                now kept and booked from the actual fill by monitor_trade().
+             3) Under the control panel the bot no longer exits at midnight,
+                on weekends, on early shutdown or on an after-close error
+                (NVDA_MANAGED=1): nothing would restart it, since the 8:20
+                launch just finds the panel already running. Standalone runs
+                keep the exit-for-Task-Scheduler behaviour. Also fixed the
+                daily summary being re-saved on every after-hours poll.
+           Backtester: the simulated broker queues market orders placed while
+           the market is closed (filled at the next open, as Alpaca does) and
+           the replay runs a post-midnight poll, so overnight behaviour is
+           simulated the way the live bot runs.
+  v5.02 — Multi-symbol backtesting support. score_fvg()'s hardcoded $0.20-
+           $0.50 "ideal size" bonus moved to CONFIG (fvg_ideal_min_size /
+           fvg_ideal_max_size, same values, identical NVDA behaviour) so the
+           backtester's volatility-scaled mode can adjust every dollar-
+           denominated threshold when testing other symbols.
   v5.01 — Claude second opinion (shadow mode). When enabled in the new Claude
            tab, every trade the bot enters is sent to Claude (claude-opus-5-5,
            effort high, structured JSON verdict, server-side refusal
@@ -1652,6 +1684,11 @@ IS_PAPER          = "paper-api" in ALPACA_BASE_URL
 # "tradingview" (only TradingView webhook alerts open trades), or "both".
 SIGNAL_SOURCE = (os.environ.get("NVDA_SIGNAL_SOURCE") or _SETTINGS.get("signal_source") or "bot").lower()
 
+# v5.03: set by the control panel. A managed bot stays up across days instead of
+# exiting at midnight / weekends for Task Scheduler to restart it — under the
+# panel nothing would restart it (the 8:20 launch just finds the panel running).
+MANAGED = os.environ.get("NVDA_MANAGED") == "1"
+
 # TradingView webhook receiver — disabled unless a passphrase is set.
 TV_WEBHOOK_PASSPHRASE = os.environ.get("NVDA_TV_PASSPHRASE") or _SETTINGS.get("tv_passphrase", "")
 TV_WEBHOOK_PORT       = int(os.environ.get("NVDA_TV_PORT") or _SETTINGS.get("tv_port") or 8090)
@@ -1694,6 +1731,8 @@ CONFIG = {
     "qqq_ticker":         "QQQ",
     "min_fvg_size":       0.20,
     "max_fvg_size":       2.00,
+    "fvg_ideal_min_size": 0.20,   # v5.02: was hardcoded in score_fvg() — "+2 ideal size" bonus range ($)
+    "fvg_ideal_max_size": 0.50,
     "min_body_ratio":     0.40,
     "max_fvg_age_min":    999,
     "trend_lookback":     25,   # v4.3: increased from 10 for stability
@@ -3822,6 +3861,14 @@ def reset_daily_state():
                 # below; that's for the genuinely-nothing-left-open case.
                 log("New day detected — all open positions are exempt "
                     "overnight-carry trades, preserving them untouched", "INFO")
+            elif _non_exempt_trades:
+                # v5.03: these used to be wiped from active_trades right here,
+                # so a position this reset closed never reached the trade log,
+                # daily P&L or Claude's scoreboard. Keep them: on the next poll
+                # monitor_trade() sees the position gone and books each one
+                # from Alpaca's actual fill, like any other broker-side close.
+                log("New-day reset closed the position — it will be booked from the "
+                    "actual fill on the next monitor pass", "WARN")
             else:
                 state["active_trades"] = []
                 state["active_trade"]  = None
@@ -5039,7 +5086,7 @@ def score_fvg(fvg, qqq_dir, avg_volume, kill_zone_start):
     if kill_zone_start == "09:30":
         score += w["morning_window"]
         notes.append(f"+{w['morning_window']} morning window")
-    if 0.20 <= fvg["size"] <= 0.50:
+    if CONFIG.get("fvg_ideal_min_size", 0.20) <= fvg["size"] <= CONFIG.get("fvg_ideal_max_size", 0.50):
         score += w["fvg_ideal_size"]
         notes.append(f"+{w['fvg_ideal_size']} ideal size")
     if (fvg["type"] == "bearish" and qqq_dir == "bearish") or \
@@ -8453,7 +8500,7 @@ def run_bot():
         try:
             state["_last_heartbeat"] = time.time()
             reset_daily_state()
-            today = now_local().date()
+            today = now_et().date()   # v5.03: the trading day (ET) — local date re-saved summaries east of ET
 
             if last_summary_date != today:
                 summary_saved_today = False
@@ -8481,9 +8528,13 @@ def run_bot():
                 if has_open:
                     monitor_trade()
                 # v4.10: Exit on weekends — prevents 48hr Yahoo rate limit burnout
-                if now_check.weekday() >= 5 and not has_open:
+                if now_check.weekday() >= 5 and not has_open and not MANAGED:
                     log(f"Weekend detected ({now_check.strftime('%A')}) — "
                         f"shutting down. Task Scheduler restarts Monday at 8:20 AM.")
+                    sys.exit(0)
+                # Standalone runs exit for Task Scheduler's restart once flat
+                # (v4.86); a panel-managed bot just keeps polling (v5.03).
+                if not has_open and not MANAGED and now_check.hour == 0 and now_check.minute < 1:
                     sys.exit(0)
                 # Outside market hours on a weekday — keep dashboard alive but don't trade
                 # (also enters here on a weekend if a trade is still open, instead
@@ -8492,35 +8543,24 @@ def run_bot():
                     if not summary_saved_today:
                         save_daily_summary()
                         summary_saved_today = True
-                    log("After market hours — dashboard staying up for review. Bot resumes tomorrow at 9:30 ET.")
-                    state["status"] = "After hours — dashboard active"
-                    while True:
-                        now_idle = datetime.now(MARKET_TZ)
-                        # v4.79 CRITICAL fix: this loop used to just sleep — a VWAP
-                        # short confirmed live: EOD force-close (inside
-                        # _monitor_bot_trade) tried and failed 11 times in the ~5min
-                        # window before this loop took over (close_all() rejected by
-                        # Alpaca: "insufficient qty available... available: 0" — an
-                        # unrelated stop order was reserving the shares). Once this
-                        # idle loop started, monitor_trade() was NEVER called again —
-                        # no further close attempts, no stop/target checks, nothing —
-                        # until the process exited at midnight and reconnected the
-                        # NEXT morning. The position sat completely unmonitored
-                        # overnight; only luck (favorable price movement) meant it
-                        # didn't turn into a real loss. Keep retrying instead of
-                        # abandoning it — harmless no-op once actually flat.
-                        idle_has_open = bool(get_active_trades())
-                        if idle_has_open:
-                            monitor_trade()
-                        # v4.86: only exit once actually flat — see note above.
-                        if not idle_has_open:
-                            # Exit at midnight to allow clean restart by Task Scheduler
-                            if now_idle.hour == 0 and now_idle.minute < 1:
-                                sys.exit(0)
-                            # Exit on weekend
-                            if now_idle.weekday() >= 5:
-                                sys.exit(0)
-                        time.sleep(30)
+                        last_summary_date   = today     # v5.03: else re-saved every poll
+                    # v5.03: this used to be a nested `while True` that never
+                    # returned to the main loop, so it (1) never refreshed the
+                    # watchdog heartbeat — the v4.96 watchdog force-killed the
+                    # bot ~5 min after every close (and mid-SWING-6M-hold),
+                    # (2) with a position carried overnight, never scanned,
+                    # reset the day or ran EOD checks again until that position
+                    # closed, and (3) never let reset_daily_state() run at the
+                    # date change. Now each after-hours poll is one main-loop
+                    # iteration: heartbeat + reset at the top, monitor above,
+                    # and the normal trading branch takes over at the open.
+                    if state.get("_after_hours_logged") != str(now_check.date()):
+                        state["_after_hours_logged"] = str(now_check.date())
+                        log("After market hours — dashboard staying up for review. Bot resumes tomorrow at 9:30 ET.")
+                    state["status"] = ("After hours — monitoring open position" if has_open
+                                       else "After hours — dashboard active")
+                    time.sleep(30)
+                    continue
                 # Optional early shutdown (e.g. travel day)
                 early = CONFIG.get("early_shutdown_et")
                 if early:
@@ -8530,7 +8570,10 @@ def run_bot():
                             f"Set CONFIG['early_shutdown_et'] = None to resume normal hours.")
                         if not summary_saved_today:
                             save_daily_summary()
-                        sys.exit(0)
+                            summary_saved_today = True
+                            last_summary_date   = today
+                        if not MANAGED:
+                            sys.exit(0)
                 state["status"] = "Market closed — waiting for open"
                 time.sleep(CONFIG["poll_seconds"])
                 continue
@@ -8550,6 +8593,7 @@ def run_bot():
                 if not summary_saved_today:
                     save_daily_summary()
                     summary_saved_today = True
+                    last_summary_date   = today
                 state["status"] = "After hours — dashboard active"
                 # v4.79 fix: same gap as the idle loop above (this branch is reached
                 # instead of that one when is_market_open() still returns True by
@@ -8741,7 +8785,7 @@ def run_bot():
             # reported "ATR not available yet" even after the bot had been
             # running for a while. Renamed so it no longer collides.
             _err_now_et = datetime.now(MARKET_TZ)
-            if _err_now_et.hour >= 16:
+            if _err_now_et.hour >= 16 and not MANAGED:
                 log("Error occurred after market close — shutting down to prevent overnight loop.")
                 sys.exit(0)
             time.sleep(60)
@@ -8767,7 +8811,7 @@ import webbrowser
 # CONFIG
 # ═══════════════════════════════════════════════════════════════
 
-VERSION         = "v5.01"
+VERSION         = "v5.03"
 HERE            = os.path.dirname(os.path.abspath(__file__))
 BOT_SCRIPT      = os.path.abspath(__file__)   # Start Bot runs this same file…
 BOT_ARGS        = ["--run-bot"]                # …in bot mode
@@ -9029,6 +9073,7 @@ class BotProcess:
                 "NVDA_TV_PASSPHRASE": s["tv_passphrase"],
                 "NVDA_TV_PORT":       str(s["tv_port"]),
                 "NVDA_CLAUDE_ENABLED": "1" if s["claude_enabled"] else "0",
+                "NVDA_MANAGED":       "1",
                 "PYTHONIOENCODING":   "utf-8",
                 "PYTHONUNBUFFERED":   "1",
             })

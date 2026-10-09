@@ -78,9 +78,7 @@ def _daily_from_intraday(df):
     return d
 
 
-def load_alpaca(start, end, warmup_days):
-    import requests
-    sys.path.insert(0, HERE)
+def alpaca_headers():
     s = {}
     try:
         with open(os.path.join(HERE, "nvda_settings.json"), encoding="utf-8") as f:
@@ -91,50 +89,68 @@ def load_alpaca(start, end, warmup_days):
     sec = os.environ.get("ALPACA_SECRET_KEY") or s.get("alpaca_secret_key")
     if not key or not sec:
         sys.exit("No Alpaca keys — save them in the dashboard's Settings tab first.")
-    hdr = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec}
+    return {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec}
 
-    def bars(sym, tf, a, b):
-        out, tok = [], None
-        while True:
-            p = {"timeframe": tf, "start": a, "end": b, "limit": 10000, "feed": "iex", "adjustment": "raw"}
-            if tok:
-                p["page_token"] = tok
-            r = requests.get(f"https://data.alpaca.markets/v2/stocks/{sym}/bars", headers=hdr, params=p, timeout=60)
-            r.raise_for_status()
-            j = r.json()
-            out += j.get("bars") or []
-            tok = j.get("next_page_token")
-            if not tok:
-                break
-        df = pd.DataFrame(out)
-        if df.empty:
-            sys.exit(f"Alpaca returned no {tf} bars for {sym}")
-        df.index = pd.to_datetime(df["t"], utc=True)
-        return df.rename(columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
 
+def alpaca_bars(sym, tf, a, b, hdr):
+    import requests
+    out, tok = [], None
+    while True:
+        p = {"timeframe": tf, "start": a, "end": b, "limit": 10000, "feed": "iex", "adjustment": "raw"}
+        if tok:
+            p["page_token"] = tok
+        r = requests.get(f"https://data.alpaca.markets/v2/stocks/{sym}/bars", headers=hdr, params=p, timeout=60)
+        r.raise_for_status()
+        j = r.json()
+        out += j.get("bars") or []
+        tok = j.get("next_page_token")
+        if not tok:
+            break
+    df = pd.DataFrame(out)
+    if df.empty:
+        raise RuntimeError(f"Alpaca returned no {tf} bars for {sym}")
+    df.index = pd.to_datetime(df["t"], utc=True)
+    return df.rename(columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
+
+
+def _alpaca_window(start, end, warmup_days):
     a = (pd.Timestamp(start) - pd.Timedelta(days=warmup_days * 1.6 + 3)).strftime("%Y-%m-%dT00:00:00Z")
     b = (pd.Timestamp(end) + pd.Timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
     da = (pd.Timestamp(start) - pd.Timedelta(days=260)).strftime("%Y-%m-%dT00:00:00Z")
-    print("Downloading NVDA/QQQ 5-min and daily bars from Alpaca (IEX)…")
-    nv, qq = _clean(bars("NVDA", "5Min", a, b)), _clean(bars("QQQ", "5Min", a, b))
-    daily = bars("NVDA", "1Day", da, b)[["Open", "High", "Low", "Close", "Volume"]]
+    return a, b, da
+
+
+def _alpaca_daily(sym, da, b, hdr):
+    daily = alpaca_bars(sym, "1Day", da, b, hdr)[["Open", "High", "Low", "Close", "Volume"]]
     daily.index = pd.to_datetime(daily.index.tz_convert(ET).date)
+    return daily
+
+
+def load_alpaca(start, end, warmup_days, symbol="NVDA"):
+    hdr = alpaca_headers()
+    a, b, da = _alpaca_window(start, end, warmup_days)
+    print(f"Downloading {symbol}/QQQ 5-min and daily bars from Alpaca (IEX)…")
+    try:
+        nv, qq = _clean(alpaca_bars(symbol, "5Min", a, b, hdr)), _clean(alpaca_bars("QQQ", "5Min", a, b, hdr))
+        daily = _alpaca_daily(symbol, da, b, hdr)
+    except RuntimeError as e:
+        sys.exit(str(e))
     return nv, qq, daily
 
 
-def load_yfinance():
+def load_yfinance(symbol="NVDA"):
     import yfinance as yf
-    print("Downloading NVDA/QQQ 5-min (last ~60 days) and daily bars from Yahoo…")
-    nv = yf.Ticker("NVDA").history(period="59d", interval="5m", auto_adjust=False)
+    print(f"Downloading {symbol}/QQQ 5-min (last ~60 days) and daily bars from Yahoo…")
+    nv = yf.Ticker(symbol).history(period="59d", interval="5m", auto_adjust=False)
     qq = yf.Ticker("QQQ").history(period="59d", interval="5m", auto_adjust=False)
-    daily = yf.Ticker("NVDA").history(period="2y", interval="1d", auto_adjust=False)
+    daily = yf.Ticker(symbol).history(period="2y", interval="1d", auto_adjust=False)
     daily.index = pd.to_datetime(daily.index.tz_localize(None).date)
     if nv.empty or qq.empty:
         sys.exit("Yahoo returned no data (rate limited or blocked).")
     return _clean(nv), _clean(qq), daily[["Open", "High", "Low", "Close", "Volume"]]
 
 
-def load_csv(path, qqq_path):
+def load_csv(path, qqq_path, daily_path=None):
     def rd(p):
         df = pd.read_csv(p)
         cols = {c.lower(): c for c in df.columns}
@@ -148,10 +164,15 @@ def load_csv(path, qqq_path):
     if qq is None:
         print("No QQQ file — QQQ direction will read 'neutral' every scan.")
         qq = nv.iloc[0:0]
-    return nv, qq, _daily_from_intraday(nv)
+    if daily_path:
+        daily = pd.read_csv(daily_path, index_col=0, parse_dates=True)[["Open", "High", "Low", "Close", "Volume"]]
+        daily.index = pd.to_datetime(daily.index.date)
+    else:
+        daily = _daily_from_intraday(nv)
+    return nv, qq, daily
 
 
-def make_synthetic(days, seed):
+def make_synthetic(days, seed, base_price=120.0, vol_mult=1.0):
     """Random-walk prices with intraday volatility/volume smiles, occasional
     shocks and gaps. Purely to exercise every code path — NOT market data."""
     rng = np.random.default_rng(seed)
@@ -159,7 +180,7 @@ def make_synthetic(days, seed):
     slots = [(9, 30 + 5 * i) if 30 + 5 * i < 60 else (10 + (30 + 5 * i - 60) // 60, (30 + 5 * i - 60) % 60)
              for i in range(78)]
     idx, rows_n, rows_q = [], [], []
-    px, qx = 120.0, 450.0
+    px, qx = float(base_price), 450.0
     regime = 0.0
     for d in sessions:
         if rng.random() < 0.12:
@@ -170,7 +191,7 @@ def make_synthetic(days, seed):
             smile = 1.8 - 1.6 * math.sin(math.pi * k / 77)
             r_m = rng.normal(0, 0.0008)
             shock = rng.normal(0, 0.012) if rng.random() < 0.004 else 0.0
-            rn = regime / 78 + 1.4 * r_m + rng.normal(0, 0.0013 * smile) + shock
+            rn = (regime / 78 + 1.4 * r_m + rng.normal(0, 0.0013 * smile) + shock) * vol_mult
             rq = r_m + rng.normal(0, 0.0005 * smile)
             o, c = px, px * math.exp(rn)
             wig = abs(rng.normal(0, 0.0009 * smile)) * px
@@ -208,11 +229,11 @@ class SimDatetime(_real_datetime):
 
 class Feed:
     """Serves 'what Alpaca would return right now': completed bars only."""
-    def __init__(self, nv, qq, daily):
-        self.data = {"NVDA": nv, "QQQ": qq}
+    def __init__(self, nv, qq, daily, symbol="NVDA"):
+        self.data = {"QQQ": qq, symbol: nv}  # symbol last: if it IS QQQ, its own bars win
         self.daily = daily
-        self.pos = {"NVDA": 0, "QQQ": 0}     # number of completed bars available
-        self.day_start = {"NVDA": 0, "QQQ": 0}
+        self.pos = {k: 0 for k in self.data}     # number of completed bars available
+        self.day_start = {k: 0 for k in self.data}
         self.ts = {k: v.index for k, v in self.data.items()}
 
     def advance_to(self, t_complete_before):
@@ -307,11 +328,37 @@ class Broker:
     def _market_price(self, side):
         return self.px + self.slip if side == "buy" else self.px - self.slip
 
+    @staticmethod
+    def market_open():
+        n = Clock.now.astimezone(ET)
+        return n.weekday() < 5 and (9 * 60 + 30) <= n.hour * 60 + n.minute < 16 * 60
+
+    def _queue_market(self, symbol, qty, side):
+        """Alpaca accepts market orders while closed and fills them at the next open."""
+        o = Order(id=self._id(), symbol=symbol, qty=str(qty), side=side, type="market", status="accepted",
+                  time_in_force="day", order_class="simple", filled_avg_price=None, filled_qty=None,
+                  filled_at=None, position_intent=None, stop_price=None, limit_price=None, queued=True)
+        self.orders.append(o)
+        return o
+
     # ── called by the simulator each tick ─────────────────────
     def tick(self, price, prev):
         self.px = price
+        if self.market_open():
+            for o in [o for o in self.orders if getattr(o, "queued", False)]:
+                if o not in self.orders:
+                    continue
+                self.orders.remove(o)
+                qty = int(o.qty)
+                reducing = self.qty != 0 and (self.qty > 0) != (o.side == "buy")
+                if reducing:
+                    qty = min(qty, abs(self.qty))
+                if qty > 0:
+                    self._fill(o.side, qty, self._market_price(o.side), "queued market (open)", o)
         for o in list(self.orders):
             if o not in self.orders:
+                continue
+            if getattr(o, "queued", False):
                 continue
             if o.type == "stop":
                 sp = float(o.stop_price)
@@ -328,11 +375,15 @@ class Broker:
                     self._fill(o.side, int(o.qty), lp, "broker limit", o)
 
     def expire_day_orders(self):
+        """Working 'day' orders end at the close; orders queued after hours wait for the open."""
+        keep = []
         for o in self.orders:
-            if o.time_in_force == "day":
+            if o.time_in_force == "day" and not getattr(o, "queued", False):
                 o.status = "expired"
                 self.closed.append(o)
-        self.orders = [o for o in self.orders if o.time_in_force != "day"]
+            else:
+                keep.append(o)
+        self.orders = keep
 
     # ── Alpaca API surface used by the bot ────────────────────
     def get_account(self):
@@ -358,7 +409,7 @@ class Broker:
                                      side="long" if self.qty > 0 else "short")
 
     def list_positions(self):
-        return [self.get_position("NVDA")] if self.qty else []
+        return [self.get_position("")] if self.qty else []
 
     def list_orders(self, status="open", symbols=None, limit=None, after=None, **kw):
         if status == "open":
@@ -383,6 +434,8 @@ class Broker:
     def submit_order(self, symbol, qty, side, type, time_in_force="day", order_class=None,
                      stop_loss=None, take_profit=None, stop_price=None, limit_price=None, **kw):
         qty = int(float(qty))
+        if type == "market" and not self.market_open() and order_class != "bracket":
+            return self._queue_market(symbol, qty, side)
         mk = lambda **a: Order(id=self._id(), symbol=symbol, qty=str(qty), side=side, status="new",
                                time_in_force=time_in_force, order_class=order_class or "simple",
                                filled_avg_price=None, filled_qty=None, filled_at=None,
@@ -410,9 +463,15 @@ class Broker:
     def close_position(self, sym):
         if self.qty == 0:
             raise Exception("position does not exist")
+        side = "sell" if self.qty > 0 else "buy"
+        if not self.market_open():
+            if not any(getattr(o, "queued", False) and o.side == side for o in self.orders):
+                for o in list(self.orders):
+                    self.cancel_order(o.id)
+                self._queue_market(sym, abs(self.qty), side)
+            return
         for o in list(self.orders):
             self.cancel_order(o.id)
-        side = "sell" if self.qty > 0 else "buy"
         self._fill(side, abs(self.qty), self._market_price(side), "close_position",
                    Order(id=self._id(), symbol=sym, qty=str(abs(self.qty)), side=side, type="market",
                          time_in_force="day", order_class="simple", status="new", position_intent=None,
@@ -525,10 +584,26 @@ def bar_path(o, h, l, c):
     return out
 
 
+# CONFIG values measured in dollars (tuned on NVDA's price/volatility). The
+# "scaled" multi-symbol mode multiplies these by the symbol's 5-min volatility
+# relative to NVDA; everything else in the strategies is ATR- or %-based.
+DOLLAR_PARAMS = ("min_fvg_size", "max_fvg_size", "fvg_ideal_min_size", "fvg_ideal_max_size", "stop_buffer",
+                 "range_min_swing", "range_tolerance", "range_t2_min_swing", "range_t2_max_swing",
+                 "range_t2_tolerance", "wide_range_threshold")
+
+
 def run(nv, qq, daily, args):
-    feed = Feed(nv, qq, daily)
+    for k, v in (("symbol", "NVDA"), ("scale", 1.0), ("mode", "asis")):   # callers that build args by hand
+        if not hasattr(args, k):
+            setattr(args, k, v)
+    feed = Feed(nv, qq, daily, args.symbol)
     broker = Broker(args.equity, args.slippage)
     bot, events = load_bot(feed, broker, args.quiet)
+    bot.CONFIG["ticker"] = args.symbol
+    if args.scale and abs(args.scale - 1.0) > 1e-9:
+        for k in DOLLAR_PARAMS:
+            if k in bot.CONFIG:
+                bot.CONFIG[k] = round(bot.CONFIG[k] * args.scale, 4)
     for k, v in (args.set or {}).items():
         bot.CONFIG[k] = v
     if args.signal_source:
@@ -574,6 +649,16 @@ def run(nv, qq, daily, args):
         if bot.get_active_trades():          # main(): after hours → monitor only
             bot.monitor_trade()
         broker.expire_day_orders()
+        # overnight: the live bot keeps polling; the new-day reset runs once the
+        # date changes (local midnight). One poll at 02:00 ET covers every US
+        # timezone and UTC. Market orders placed now queue until the open.
+        nxt = d + timedelta(days=1)
+        Clock.now = _real_datetime(nxt.year, nxt.month, nxt.day, 2, 0, 0, tzinfo=ET)
+        feed.advance_to(pd.Timestamp(Clock.now))
+        bot.reset_daily_state()
+        if bot.get_active_trades():
+            bot.monitor_trade()
+        Clock.now = _real_datetime(d.year, d.month, d.day, 16, 0, 30, tzinfo=ET)
         eq = float(broker.get_account().portfolio_value)
         equity_rows.append({"date": str(d), "equity": round(eq, 2), "position": broker.qty})
         if not args.quiet and (di % 10 == 0):
@@ -607,6 +692,31 @@ def sanity_checks(broker, closed, tdf, unmatched, args):
         over = (tdf.opened.values[1:] < tdf.closed.values[:-1]).sum() if len(tdf) > 1 else 0
         out.append((over == 0, "never more than one position open at a time"))
     return out
+
+
+def _group_stats(g):
+    if g is None or g.empty:
+        return {"trades": 0, "win_rate": None, "pnl": 0.0, "avg_r": None, "profit_factor": None}
+    wins, losses = g[g.pnl > 0].pnl.sum(), g[g.pnl <= 0].pnl.sum()
+    r = g.r_multiple.dropna()
+    return {"trades": int(len(g)), "win_rate": round(100 * (g.pnl > 0).mean(), 1),
+            "pnl": round(float(g.pnl.sum()), 2), "avg_r": round(float(r.mean()), 3) if len(r) else None,
+            "profit_factor": round(float(wins / -losses), 2) if losses < 0 else None}
+
+
+def write_summary_json(args, tdf, edf, checks, errs, label, skipped=None):
+    os.makedirs(args.out, exist_ok=True)
+    out = {"symbol": args.symbol, "mode": args.mode, "scale": args.scale, "label": label, "skipped": skipped}
+    if not skipped:
+        eq = edf.equity if len(edf) else pd.Series([args.equity])
+        out.update(_group_stats(tdf if not tdf.empty else None))
+        out.update({"return_pct": round(float(tdf.pnl.sum()) / args.equity * 100, 3) if not tdf.empty else 0.0,
+                    "max_drawdown": round(float((eq - eq.cummax()).min()), 2),
+                    "checks_ok": all(ok for ok, _ in checks), "bot_errors": len(errs),
+                    "period": [str(edf["date"].iloc[0]), str(edf["date"].iloc[-1])] if len(edf) else None,
+                    "by_strategy": {k: _group_stats(g) for k, g in tdf.groupby("strategy")} if not tdf.empty else {}})
+    with open(os.path.join(args.out, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=1)
 
 
 def report(broker, closed, equity_rows, events, args, first_day, label):
@@ -680,10 +790,229 @@ def report(broker, closed, equity_rows, events, args, first_day, label):
     text = "\n".join(lines)
     with open(os.path.join(args.out, "summary.txt"), "w", encoding="utf-8") as f:
         f.write(text + "\n")
+    write_summary_json(args, tdf, edf, checks, errs, label)
     print("\n" + text)
     print(f"\nWrote {args.out}/trades.csv, equity.csv, summary.txt")
     return tdf, edf
 
+
+
+# ═══════════════════════════════════════════════════════════════
+# MULTI-SYMBOL
+# ═══════════════════════════════════════════════════════════════
+# Default universe: NVDA plus liquid US stocks and ETFs that trade in the same
+# 09:30-16:00 session the strategies were built for. "Other markets" here means
+# gold, bonds, oil and energy through their ETFs — crypto and forex don't fit
+# this strategy's session-based design without rework.
+DEFAULT_UNIVERSE = ["NVDA", "AMD", "AVGO", "TSM", "MSFT", "AAPL", "META", "AMZN", "GOOGL", "TSLA",
+                    "SPY", "QQQ", "IWM", "GLD", "TLT", "USO", "XLE"]
+PRICE_RANGE = (50, 2000)        # the bot's price-history guard (50 < price < 2000) drops anything outside
+
+
+def _median_true_range(df):
+    prev = df["Close"].shift(1)
+    tr = pd.concat([df["High"] - df["Low"], (df["High"] - prev).abs(), (df["Low"] - prev).abs()], axis=1).max(axis=1)
+    return float(tr.dropna().median())
+
+
+def _save(df, path):
+    df.to_csv(path, index_label="timestamp")
+
+
+def prepare_data(symbols, args, data_dir):
+    """Download (or generate) every symbol once into data_dir as CSV."""
+    os.makedirs(data_dir, exist_ok=True)
+    need = list(dict.fromkeys(["NVDA", "QQQ"] + symbols))
+    files = {}
+    if args.source == "synthetic":
+        rng = np.random.default_rng(args.seed)
+        for i, sym in enumerate(need):
+            base = {"NVDA": 120.0, "QQQ": 450.0}.get(sym, float(rng.uniform(60, 600)))
+            vol = 1.0 if sym == "NVDA" else float(rng.uniform(0.4, 1.6))
+            nv, _, daily = make_synthetic(args.synthetic_days, args.seed + 101 * i, base, vol)
+            _save(nv, f"{data_dir}/{sym}_5m.csv"); _save(daily, f"{data_dir}/{sym}_1d.csv")
+            files[sym] = True
+        return files, "SYNTHETIC random-walk data — mechanics check only, NOT a performance result"
+    if args.source == "alpaca":
+        hdr = alpaca_headers()
+        a, b, da = _alpaca_window(args.start, args.end, args.warmup)
+        tag = f"{args.start}_{args.end}"
+        for sym in need:
+            p5, pd1 = f"{data_dir}/{sym}_5m_{tag}.csv", f"{data_dir}/{sym}_1d_{tag}.csv"
+            if not (os.path.exists(p5) and os.path.exists(pd1)):
+                print(f"  downloading {sym}…")
+                try:
+                    _save(_clean(alpaca_bars(sym, "5Min", a, b, hdr)), p5)
+                    _save(_alpaca_daily(sym, da, b, hdr), pd1)
+                except Exception as e:
+                    print(f"  ! {sym}: {e}")
+                    continue
+            files[sym] = (p5, pd1)
+        return files, f"Alpaca IEX 5-min bars {args.start} → {args.end}"
+    # yfinance
+    import yfinance as yf
+    for sym in need:
+        p5, pd1 = f"{data_dir}/{sym}_5m_yf.csv", f"{data_dir}/{sym}_1d_yf.csv"
+        print(f"  downloading {sym}…")
+        try:
+            nv = yf.Ticker(sym).history(period="59d", interval="5m", auto_adjust=False)
+            d = yf.Ticker(sym).history(period="2y", interval="1d", auto_adjust=False)
+            if nv.empty:
+                raise RuntimeError("no data")
+            d.index = pd.to_datetime(d.index.tz_localize(None).date)
+            _save(_clean(nv), p5); _save(d[["Open", "High", "Low", "Close", "Volume"]], pd1)
+            files[sym] = (p5, pd1)
+        except Exception as e:
+            print(f"  ! {sym}: {e}")
+    return files, "Yahoo 5-min bars (last ~55 trading days)"
+
+
+def run_many(args):
+    import concurrent.futures as cf
+    import subprocess
+    syms = DEFAULT_UNIVERSE if args.symbols.lower() == "default" else \
+        [x.strip().upper() for x in args.symbols.split(",") if x.strip()]
+    modes = [m.strip() for m in args.modes.split(",") if m.strip() in ("asis", "scaled")] or ["asis"]
+    if args.source == "alpaca":
+        args.start = args.start or (pd.Timestamp.now(tz=ET) - pd.Timedelta(days=182)).strftime("%Y-%m-%d")
+        args.end = args.end or (pd.Timestamp.now(tz=ET) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    data_dir = os.path.join(args.out, "_data")
+    print(f"Preparing data for {len(syms)} symbols ({args.source})…")
+    files, label = prepare_data(syms, args, data_dir)
+
+    def paths(sym):
+        f = files.get(sym)
+        if f is True:
+            return f"{data_dir}/{sym}_5m.csv", f"{data_dir}/{sym}_1d.csv"
+        return f
+    if "NVDA" not in files or "QQQ" not in files:
+        sys.exit("NVDA and QQQ data are required (NVDA is the volatility reference, QQQ the market filter).")
+    ref_tr = _median_true_range(pd.read_csv(paths("NVDA")[0], index_col=0))
+    qqq5 = paths("QQQ")[0]
+
+    jobs, notes = [], {}
+    for sym in syms:
+        if sym not in files:
+            notes[sym] = "no data"
+            continue
+        df = pd.read_csv(paths(sym)[0], index_col=0)
+        med = float(df["Close"].median())
+        if not (PRICE_RANGE[0] < med < PRICE_RANGE[1]):
+            notes[sym] = f"skipped: median price ${med:,.2f} is outside the bot's ${PRICE_RANGE[0]}-${PRICE_RANGE[1]} range"
+            continue
+        scale = round(_median_true_range(df) / ref_tr, 3) if ref_tr else 1.0
+        for mode in modes:
+            if mode == "scaled" and sym == "NVDA":
+                continue                         # scale is 1.0 by definition — identical to as-is
+            out = os.path.join(args.out, f"{sym}_{mode}")
+            cmd = [sys.executable, os.path.abspath(__file__), "--source", "csv", "--csv", paths(sym)[0],
+                   "--qqq-csv", qqq5, "--daily-csv", paths(sym)[1], "--symbol", sym, "--mode", mode,
+                   "--scale", str(scale if mode == "scaled" else 1.0), "--out", out, "--quiet",
+                   "--equity", str(args.equity), "--slippage", str(args.slippage), "--warmup", str(args.warmup),
+                   "--label", label]
+            if args.start and args.source == "alpaca":
+                cmd += ["--start", args.start]
+            if args.end and args.source == "alpaca":
+                cmd += ["--end", args.end]
+            if args.set:
+                cmd += ["--set", json.dumps(args.set)]
+            jobs.append((sym, mode, scale, out, cmd))
+
+    print(f"Running {len(jobs)} backtests, {args.jobs} at a time…")
+    t0 = _real_time.time()
+
+    def go(job):
+        sym, mode, scale, out, cmd = job
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        return job, r.returncode, r.stderr[-1500:]
+    results = []
+    with cf.ThreadPoolExecutor(max_workers=args.jobs) as ex:
+        for job, rc, err in ex.map(go, jobs):
+            sym, mode, scale, out, _ = job
+            try:
+                with open(os.path.join(out, "summary.json"), encoding="utf-8") as f:
+                    res = json.load(f)
+            except OSError:
+                res = {"symbol": sym, "mode": mode, "skipped": f"run failed (exit {rc}): {err.strip()[-300:]}"}
+            res["scale"] = scale if mode == "scaled" else 1.0
+            res["vol_ratio"] = scale
+            results.append(res)
+            print(f"  {sym:6s} {mode:6s} " + (f"skipped — {res['skipped']}" if res.get("skipped") else
+                  f"{res['trades']:4d} trades  net ${res['pnl']:>10,.2f}  ({_real_time.time() - t0:.0f}s)"))
+    multi_report(results, notes, args, label)
+
+
+def multi_report(results, notes, args, label):
+    ok = [r for r in results if not r.get("skipped")]
+    lines = [f"MULTI-SYMBOL BACKTEST — {label}",
+             f"Each symbol starts with ${args.equity:,.0f}; slippage ${args.slippage:.3f}/share; same bot code and settings.",
+             "as-is  = your exact settings.  scaled = dollar-based thresholds (FVG size, RANGE swing, wide-day)",
+             "         multiplied by the symbol's 5-min volatility relative to NVDA (the 'vol×' column).", ""]
+    rows = []
+    for mode in ("asis", "scaled"):
+        rs = sorted([r for r in ok if r["mode"] == mode], key=lambda r: -r["pnl"])
+        if not rs:
+            continue
+        lines.append(f"── {('AS-IS' if mode == 'asis' else 'SCALED')} ──")
+        lines.append(f"{'symbol':7s}{'vol×':>6s}{'trades':>8s}{'win%':>7s}{'net $':>12s}{'ret %':>8s}{'avg R':>8s}"
+                     f"{'PF':>6s}{'max DD $':>11s}  checks")
+        for r in rs:
+            fmt = lambda v, f: (f.format(v) if v is not None else "—")
+            lines.append(f"{r['symbol']:7s}{r.get('vol_ratio', r['scale']):6.2f}{r['trades']:8d}{fmt(r['win_rate'], '{:.1f}'):>7s}"
+                         f"{r['pnl']:12,.2f}{r['return_pct']:8.2f}{fmt(r['avg_r'], '{:.2f}'):>8s}"
+                         f"{fmt(r['profit_factor'], '{:.2f}'):>6s}{r['max_drawdown']:11,.2f}  "
+                         f"{'ok' if r['checks_ok'] and not r['bot_errors'] else 'CHECK'}")
+            rows.append({k: r.get(k) for k in ("symbol", "mode", "scale", "vol_ratio", "trades", "win_rate", "pnl", "return_pct",
+                                                "avg_r", "profit_factor", "max_drawdown", "checks_ok", "bot_errors")})
+        pos = sum(1 for r in rs if r["pnl"] > 0)
+        lines += [f"Profitable on {pos} of {len(rs)} symbols.  Total ${sum(r['pnl'] for r in rs):,.2f} "
+                  f"over {sum(r['trades'] for r in rs)} trades.", ""]
+    # strategy x symbol
+    srows = []
+    for mode in ("asis", "scaled"):
+        rs = [r for r in ok if r["mode"] == mode]
+        strats = sorted({k for r in rs for k in r.get("by_strategy", {})})
+        if not strats:
+            continue
+        lines.append(f"── BY STRATEGY ({'AS-IS' if mode == 'asis' else 'SCALED'}) — does each strategy work beyond NVDA? ──")
+        lines.append(f"{'strategy':10s}{'symbols +':>11s}{'trades':>8s}{'win%':>7s}{'total $':>12s}{'avg R':>8s}{'NVDA $':>10s}")
+        for st in strats:
+            per = [(r["symbol"], r["by_strategy"][st]) for r in rs if st in r.get("by_strategy", {})]
+            n = sum(g["trades"] for _, g in per)
+            wins = sum((g["win_rate"] or 0) * g["trades"] / 100 for _, g in per)
+            tot = sum(g["pnl"] for _, g in per)
+            rr = [g["avg_r"] * g["trades"] for _, g in per if g["avg_r"] is not None]
+            avg_r = sum(rr) / n if n and rr else None
+            nv = next((g["pnl"] for s_, g in per if s_ == "NVDA"), None)
+            pos = sum(1 for _, g in per if g["pnl"] > 0)
+            lines.append(f"{st:10s}{f'{pos}/{len(per)}':>11s}{n:8d}{100 * wins / n if n else 0:7.1f}{tot:12,.2f}"
+                         f"{(f'{avg_r:.2f}' if avg_r is not None else '—'):>8s}{(f'{nv:,.2f}' if nv is not None else '—'):>10s}")
+            srows.append({"mode": mode, "strategy": st, "symbols_positive": pos, "symbols": len(per), "trades": n,
+                          "total_pnl": round(tot, 2), "avg_r": round(avg_r, 3) if avg_r is not None else None,
+                          "nvda_pnl": nv, **{f"pnl_{s_}": g["pnl"] for s_, g in per}})
+        lines.append("")
+    if notes or any(r.get("skipped") for r in results):
+        lines.append("Not run:")
+        for sym, why in notes.items():
+            lines.append(f"  {sym}: {why}")
+        for r in results:
+            if r.get("skipped"):
+                lines.append(f"  {r['symbol']} {r['mode']}: {r['skipped']}")
+        lines.append("")
+    lines += ["How to read this:",
+              "  - A strategy with an edge should make money on most symbols, in both modes. One that only",
+              "    works on NVDA (or only as-is) was probably fitted to NVDA's recent past.",
+              "  - Look at 'symbols +' and avg R, not the best symbol: with many symbols, a few look great by luck.",
+              "  - Under ~30 trades per strategy per symbol, individual numbers are mostly noise.",
+              "  - Same caveats as single runs: one period, IEX volume, estimated intrabar paths."]
+    text = "\n".join(lines)
+    with open(os.path.join(args.out, "multi_summary.txt"), "w", encoding="utf-8") as f:
+        f.write(text + "\n")
+    pd.DataFrame(rows).to_csv(os.path.join(args.out, "multi_by_symbol.csv"), index=False)
+    pd.DataFrame(srows).to_csv(os.path.join(args.out, "multi_by_strategy.csv"), index=False)
+    print("\n" + text)
+    print(f"\nWrote {args.out}/multi_summary.txt, multi_by_symbol.csv, multi_by_strategy.csv "
+          f"(per-symbol details in {args.out}/<SYMBOL>_<mode>/)")
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -699,26 +1028,46 @@ def main():
     ap.add_argument("--set", type=json.loads, help='override CONFIG, e.g. \'{"risk_reward": 2.0}\'')
     ap.add_argument("--out", default=os.path.join(HERE, "backtest_results"))
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--symbol", default="NVDA", help="symbol for a single run")
+    ap.add_argument("--symbols", help='multi-symbol run: comma list, or "default" for the built-in universe')
+    ap.add_argument("--modes", default="asis,scaled", help="multi-symbol: asis, scaled, or both")
+    ap.add_argument("--jobs", type=int, default=max(1, min(4, (os.cpu_count() or 2) - 1)),
+                    help="multi-symbol: backtests to run in parallel")
+    ap.add_argument("--mode", default="asis", help=argparse.SUPPRESS)
+    ap.add_argument("--scale", type=float, default=1.0, help=argparse.SUPPRESS)
+    ap.add_argument("--daily-csv", help=argparse.SUPPRESS)
+    ap.add_argument("--label", help=argparse.SUPPRESS)
     args = ap.parse_args()
     args.out = os.path.abspath(args.out)
+    args.symbol = args.symbol.upper()
+    if args.symbols:
+        return run_many(args)
 
     if args.source == "alpaca":
         if not args.start:
             args.start = (pd.Timestamp.now(tz=ET) - pd.Timedelta(days=90)).strftime("%Y-%m-%d")
-        nv, qq, daily = load_alpaca(args.start, args.end or pd.Timestamp.now(tz=ET).strftime("%Y-%m-%d"), args.warmup)
+        nv, qq, daily = load_alpaca(args.start, args.end or pd.Timestamp.now(tz=ET).strftime("%Y-%m-%d"),
+                                    args.warmup, args.symbol)
         label = "Alpaca IEX 5-min bars"
     elif args.source == "yfinance":
-        nv, qq, daily = load_yfinance(); label = "Yahoo 5-min bars"
+        nv, qq, daily = load_yfinance(args.symbol); label = "Yahoo 5-min bars"
     elif args.source == "csv":
         if not args.csv:
             sys.exit("--csv path required")
-        nv, qq, daily = load_csv(args.csv, args.qqq_csv); label = f"CSV {os.path.basename(args.csv)}"
+        nv, qq, daily = load_csv(args.csv, args.qqq_csv, args.daily_csv); label = f"CSV {os.path.basename(args.csv)}"
     else:
         nv, qq, daily = make_synthetic(args.synthetic_days, args.seed)
         label = f"SYNTHETIC random-walk data (seed {args.seed}) — mechanics check only, NOT a performance result"
 
-    print(f"{label}: {len(nv)} NVDA bars, {len(set(nv.index.date))} sessions, "
+    label = args.label or label
+    print(f"{label}: {len(nv)} {args.symbol} bars, {len(set(nv.index.date))} sessions, "
           f"{len(daily)} daily bars")
+    med = float(nv["Close"].median()) if len(nv) else 0.0
+    if not (50 < med < 2000):
+        write_summary_json(args, None, None, [], [], label,
+                           skipped=f"median price ${med:,.2f} is outside the bot's $50-$2000 range")
+        print(f"Skipping {args.symbol}: median price ${med:,.2f} outside $50-$2000 (the bot's price guard)")
+        return
     work = tempfile.mkdtemp(prefix="nvda_bt_")
     cwd = os.getcwd()
     os.chdir(work)               # bot writes trade_logs/* relative to cwd — keep them out of the project

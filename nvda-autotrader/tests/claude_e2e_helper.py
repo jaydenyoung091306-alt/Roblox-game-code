@@ -5,7 +5,7 @@ import sys, os, itertools, tempfile
 sys.path.insert(0, sys.argv[1]); out = sys.argv[2]
 import backtest
 args = type("A", (), dict(equity=100000, slippage=0.01, quiet=True, set=None, signal_source=None,
-                          warmup=6, start=None, end=None, out=out))()
+                          warmup=6, start=None, end=None, out=out, symbol="NVDA", scale=1.0, mode="asis"))()
 nv, qq, daily = backtest.make_synthetic(14, seed=11)
 calls = []
 orig_load = backtest.load_bot

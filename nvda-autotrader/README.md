@@ -1,4 +1,4 @@
-# NVDA AutoTrader (v5.01)
+# NVDA AutoTrader (v5.03)
 
 An algorithmic paper-trading bot for NVDA on Alpaca, with a browser control panel and a TradingView port.
 
@@ -44,7 +44,7 @@ Change your existing 8:20 AM task (it used to run `nvda_autotrader.py`, which no
 python build_dashboard.py --autostart --no-browser
 ```
 
-The panel starts, launches the bot with your saved keys, and restarts it if it crashes (pauses after 5 crashes in 10 minutes). Open http://127.0.0.1:8080 any time to check on it.
+The panel starts, launches the bot with your saved keys, and restarts it if it crashes (pauses after 5 crashes in 10 minutes). Under the panel the bot stays up across days and weekends: it rolls over to each new day by itself instead of exiting at midnight. If the panel is still running from the day before, the 8:20 launch just exits and the running bot carries on. Open http://127.0.0.1:8080 any time to check on it.
 
 > If an old copy of `nvda_autotrader.py` is still being started somewhere, delete it. The dashboard says *"A bot started outside this panel is running"* when it detects one.
 
@@ -123,13 +123,36 @@ How exits are simulated: the bot polls every 15 s, so each 5-minute bar is repla
 
 `--source synthetic` runs on made-up random prices. It only proves the machinery works; its numbers mean nothing.
 
+### Multi-symbol backtest: does the strategy work beyond NVDA?
+
+```bash
+python backtest.py --source alpaca --symbols default --start 2026-04-01 --end 2026-10-08
+python backtest.py --source alpaca --symbols NVDA,AMD,SPY,GLD          # pick your own
+python backtest.py --source yfinance --symbols default                 # last ~55 days, no keys
+```
+
+`default` covers NVDA, AMD, AVGO, TSM, MSFT, AAPL, META, AMZN, GOOGL, TSLA, SPY, QQQ and IWM, plus other markets via their ETFs: gold (GLD), bonds (TLT), oil (USO) and energy (XLE). Crypto and forex aren't included because the strategies are built around the 9:30–4:00 US session.
+
+Each symbol runs through the same unchanged bot code, two ways:
+- **as-is:** your exact settings.
+- **scaled:** the dollar-based thresholds (FVG gap size, RANGE swing size, the "wide day" threshold) are multiplied by the symbol's 5-minute volatility relative to NVDA, since $2 means something very different on a $600 ETF than on a $70 stock.
+
+Symbols whose price is outside the bot's $50–$2000 range are skipped with a note. Data is downloaded once into `backtest_results/_data/`, so re-runs are fast and work offline. Runs go in parallel (`--jobs`); expect roughly 20–30 minutes for the default list over six months.
+
+Output in `backtest_results/`:
+- `multi_summary.txt`: per-symbol tables for both modes, plus the key table, **BY STRATEGY**, showing on how many symbols each strategy made money.
+- `multi_by_symbol.csv` and `multi_by_strategy.csv`.
+- A folder per symbol with the usual `trades.csv` and `summary.txt`.
+
+How to read it: a strategy with a real edge should make money on most symbols in both modes. One that only works on NVDA, or only with NVDA's dollar settings, was probably fitted to NVDA's recent past. Judge each strategy by how many symbols it made money on and its average R, not by the best symbol, since with 17 symbols a few will look great by luck.
+
 ## Tests
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-37 tests, about a minute, no network and no real orders. They cover the control panel API and security guards, Start/Stop and auto-restart, the real bot booting from the same file, keys reaching the bot, manual trades and every TradingView webhook rule (through a simulated Alpaca account), the Claude reviewer (fake reviewer and a mocked API, never a real call), the backtester's fill logic and data loaders, and a full backtest replay.
+41 tests, about 1½ minutes, no network and no real orders. They cover the control panel API and security guards, Start/Stop and auto-restart, the real bot booting from the same file, keys reaching the bot, manual trades and every TradingView webhook rule (through a simulated Alpaca account), the Claude reviewer (fake reviewer and a mocked API, never a real call), the bot's real main loop through an evening and night on a simulated clock (watchdog heartbeat, overnight monitoring, midnight behaviour), the multi-symbol runner, the backtester's fill logic and data loaders, and a full backtest replay.
 
 ## Security notes
 

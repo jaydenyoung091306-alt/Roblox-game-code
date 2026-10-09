@@ -585,6 +585,58 @@ class ClaudeTests(unittest.TestCase):
         self.assertIn("pnl matches the bot's own trade record: True", r.stdout)
 
 
+class AfterHoursTests(unittest.TestCase):
+    """The real run_bot() loop on a simulated clock, 15:58 ET → 10:00 ET next day (v5.03 regression)."""
+    def run_scenario(self, mode, position):
+        r = subprocess.run([sys.executable, os.path.join(HERE, "tests", "afterhours_helper.py"), HERE, mode, position],
+                           capture_output=True, text=True, timeout=600, cwd=TMP)
+        self.assertEqual(r.returncode, 0, r.stderr[-3000:])
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_managed_bot_holding_overnight(self):
+        o = self.run_scenario("managed", "open")
+        self.assertLess(o["max_heartbeat_gap_s"], 300)          # the watchdog never fires
+        self.assertGreater(o["monitor_calls_night"], 100)       # the position is watched all night…
+        self.assertGreater(o["monitor_calls_morning"], 10)      # …and into the next session
+        self.assertFalse(o["closed_at_reset"])                  # exempt SWING-6M survives the reset
+        self.assertEqual(o["summary_saves_evening"], 1)
+        self.assertEqual(o["exit"], "returned")
+        self.assertEqual(o["errors"], [])
+
+    def test_managed_bot_flat_stays_up_and_trades_next_day(self):
+        o = self.run_scenario("managed", "flat")
+        self.assertLess(o["max_heartbeat_gap_s"], 300)
+        self.assertGreater(o["scans_next_morning"], 10)
+        self.assertEqual(o["exit"], "returned")                 # no midnight exit under the panel
+
+    def test_standalone_bot_still_exits_at_midnight(self):
+        o = self.run_scenario("standalone", "flat")
+        self.assertLess(o["max_heartbeat_gap_s"], 300)
+        self.assertTrue(o["exit"].startswith("sys.exit(0) at 2026-10-09 00:0"), o["exit"])
+
+
+class MultiSymbolTest(unittest.TestCase):
+    def test_multi_symbol_run(self):
+        out = os.path.join(TMP, "multi")
+        r = subprocess.run([sys.executable, os.path.join(HERE, "backtest.py"), "--source", "synthetic",
+                            "--symbols", "NVDA,AMD,GLD", "--synthetic-days", "15", "--jobs", "3", "--out", out],
+                           capture_output=True, text=True, timeout=900, cwd=TMP)
+        self.assertEqual(r.returncode, 0, r.stderr[-3000:])
+        with open(os.path.join(out, "multi_summary.txt"), encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("── AS-IS ──", text)
+        self.assertIn("── SCALED ──", text)
+        self.assertIn("BY STRATEGY (AS-IS)", text)
+        self.assertNotIn("CHECK", text.split("BY STRATEGY")[0])  # every run passed its consistency checks
+        import csv
+        with open(os.path.join(out, "multi_by_symbol.csv"), encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(sorted((x["symbol"], x["mode"]) for x in rows),
+                         [("AMD", "asis"), ("AMD", "scaled"), ("GLD", "asis"), ("GLD", "scaled"), ("NVDA", "asis")])
+        scaled = {x["symbol"]: float(x["scale"]) for x in rows if x["mode"] == "scaled"}
+        self.assertTrue(all(v > 0 and v != 1.0 for v in scaled.values()), scaled)
+
+
 class LoaderTests(unittest.TestCase):
     """Each data source's parser, fed that source's real response format (no network)."""
     @classmethod
